@@ -78,15 +78,13 @@ unsigned long lastLcdUpdate = 0;
 
 // ---- Shield button reading ----
 // standard DFRobot LCD Keypad Shield thresholds on A0
-int lastButtonADC = 0;
 int readLCDButton() {
   int adc = analogRead(A0);
-  lastButtonADC = adc;
   if (adc > 1000) return -1;  // none
   if (adc < 50)   return 0;   // right
-  if (adc < 250)  return 1;   // up
-  if (adc < 450)  return 2;   // down
-  if (adc < 650)  return 3;   // left
+  if (adc < 150)  return 1;   // up
+  if (adc < 350)  return 2;   // down
+  if (adc < 550)  return 3;   // left
   if (adc < 850)  return 4;   // select
   return -1;
 }
@@ -163,13 +161,6 @@ void loop() {
   // ---- read shield buttons, act on new press only ----
   int btn = readLCDButton();
   if (btn != -1 && btn != lastButton) {
-    // raw ADC value alongside the decoded button code, for checking the threshold table
-    // above against what this specific shield actually reads
-    Serial.print("Button pressed, code=");
-    Serial.print(btn);
-    Serial.print(", raw A0=");
-    Serial.println(lastButtonADC);
-
     if (btn == 3) manualMode1 = !manualMode1;  // LEFT toggles motor 1 mode
     if (btn == 0) manualMode2 = !manualMode2;  // RIGHT toggles motor 2 mode
 
