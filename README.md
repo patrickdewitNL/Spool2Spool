@@ -15,10 +15,11 @@ readout.
   and display can be tested without the hardware present.
 - Both motors support **manual override**, driving speed directly from a potentiometer instead
   of the automatic logic.
-- Both motor outputs stay at **zero on power-up** until a dedicated start button is pressed once.
+- Both motor outputs stay at **zero on power-up** until SELECT is pressed once on the shield.
 - The **DFRobot LCD Keypad Shield** provides local UI: LEFT/RIGHT toggle manual/auto mode per
-  motor, UP/DOWN adjust the spool diameter used for the speed readout, and the 16x2 LCD shows an
-  "EMI Twente" splash screen at boot, a "press start" prompt, then live speed/angle/mode.
+  motor, UP/DOWN adjust the spool diameter used for the speed readout, SELECT starts the system,
+  and the 16x2 LCD shows an "EMI Twente" splash screen at boot, a "press SELECT to start" prompt,
+  then live speed/angle/mode.
 
 ## Hardware
 
@@ -30,7 +31,6 @@ readout.
 - MPU6050 accelerometer/gyro, bolted to the boom body as a tilt/inclinometer (I2C) — **not yet
   physically wired up**; stubbed out behind the `USE_MPU6050` compile-time flag
 - 2x potentiometers for manual speed override, one per motor
-- External momentary pushbutton to GND, for the start interlock
 
 ## Pin mapping
 
@@ -42,12 +42,11 @@ The LCD shield occupies pins 4, 5, 6, 7, 8, 9, 10 (parallel LCD interface + back
 | 2   | Hall sensor / encoder pulse input (INT0, hardware interrupt) |
 | 3   | Motor 1 PWM output |
 | 11  | Motor 2 PWM output |
-| 12  | Start button input (`INPUT_PULLUP`, external pushbutton to GND, pressed = LOW) |
 | A1  | Motor 1 manual override potentiometer |
 | A2  | Motor 2 manual override potentiometer |
 | A4 / A5 | I2C (SDA/SCL) for the MPU6050, once connected |
 
-Free/unused: pin 13, A3.
+Free/unused: pins 12, 13, A3.
 
 ## Libraries
 

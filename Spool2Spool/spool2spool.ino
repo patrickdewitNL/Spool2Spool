@@ -3,11 +3,11 @@
   - Motor 1: closed loop constant speed via encoder/hall pulse feedback, with manual override
     (displayed as line speed in m/min, using the spool diameter set below)
   - Motor 2: speed follows boom angle from MPU6050 (I2C), with manual override
-  - Shield buttons: LEFT/RIGHT toggle manual/auto mode per motor, UP/DOWN adjust spool diameter
-  - A separate START button (pin 12, active low) must be pressed once after power up before
-    either motor output is enabled
-  - LCD shows an "EMI Twente" splash screen at boot, then a "press start" prompt, then live
-    speed/angle/mode
+  - Shield buttons: LEFT/RIGHT toggle manual/auto mode per motor, UP/DOWN adjust spool diameter,
+    SELECT starts the system
+  - Both motor outputs stay at zero after power up until SELECT is pressed once
+  - LCD shows an "EMI Twente" splash screen at boot, then a "press SELECT to start" prompt, then
+    live speed/angle/mode
 
   Libraries needed:
   - LiquidCrystal.h   (built in)
@@ -45,8 +45,7 @@ float currentLinearSpeed = 0;  // m/min, derived from currentRPM and spoolDiamet
 const int pot1Pin = A1;  // motor 1 manual speed
 const int pot2Pin = A2;  // motor 2 manual speed
 
-// ---- Start interlock, both motor outputs stay at zero until this is pressed once ----
-const int startPin = 12;  // external pushbutton to GND, INPUT_PULLUP, pressed = LOW
+// ---- Start interlock, both motor outputs stay at zero until SELECT is pressed once ----
 bool started = false;
 
 // ---- Mode state, true = manual, false = automatic ----
@@ -135,26 +134,26 @@ void setup() {
   analogWrite(motor1PwmPin, 0);
   analogWrite(motor2PwmPin, 0);
 
-  pinMode(startPin, INPUT_PULLUP);
-
   lastCalcTime = millis();
   lcd.clear();
 }
 
 void loop() {
-  // ---- both outputs stay at zero until the start button has been pressed once ----
+  // ---- both outputs stay at zero until SELECT has been pressed once ----
   if (!started) {
-    if (digitalRead(startPin) == LOW) {
+    int startBtn = readLCDButton();
+    if (startBtn == 4) {  // SELECT
       started = true;
+      lastButton = startBtn;
       lcd.clear();
     } else {
       analogWrite(motor1PwmPin, 0);
       analogWrite(motor2PwmPin, 0);
       if (millis() - lastLcdUpdate > 250) {
         lcd.setCursor(0, 0);
-        lcd.print("Press START btn ");
+        lcd.print("Press SELECT to ");
         lcd.setCursor(0, 1);
-        lcd.print("to begin        ");
+        lcd.print("start           ");
         lastLcdUpdate = millis();
       }
       return;  // skip mode/angle/motor logic entirely until started
