@@ -255,14 +255,18 @@ void loop() {
       lcd.setCursor(0, 0);
       lcd.print("Spd:");
       lcd.print(currentLinearSpeed, 1);
-      lcd.print("m/min    ");
+      lcd.print("m/min  ");
+      lcd.setCursor(13, 0);
+      lcd.print("M1");
       lcd.setCursor(15, 0);
       lcd.print(manualMode1 ? "M" : "A");
 
       lcd.setCursor(0, 1);
       lcd.print("Ang:");
       lcd.print(boomAngle, 1);
-      lcd.print("      ");
+      lcd.print("   ");
+      lcd.setCursor(13, 1);
+      lcd.print("M2");
       lcd.setCursor(15, 1);
       lcd.print(manualMode2 ? "M" : "A");
     }
