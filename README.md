@@ -42,11 +42,11 @@ The LCD shield occupies pins 4, 5, 6, 7, 8, 9, 10 (parallel LCD interface + back
 | 2   | Hall sensor / encoder pulse input (INT0, hardware interrupt) |
 | 3   | Motor 1 PWM output |
 | 11  | Motor 2 PWM output |
-| A1  | Motor 1 manual override potentiometer |
-| A2  | Motor 2 manual override potentiometer |
+| A2  | Motor 1 manual override potentiometer |
+| A3  | Motor 2 manual override potentiometer |
 | A4 / A5 | I2C (SDA/SCL) for the MPU6050, once connected |
 
-Free/unused: pins 12, 13, A3.
+Free/unused: pins 12, 13, A1.
 
 ## Libraries
 

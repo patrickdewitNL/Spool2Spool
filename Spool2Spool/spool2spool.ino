@@ -42,8 +42,8 @@ float currentRPM = 0;
 float currentLinearSpeed = 0;  // m/min, derived from currentRPM and spoolDiameterMM, for display only
 
 // ---- Manual override potentiometers ----
-const int pot1Pin = A1;  // motor 1 manual speed
-const int pot2Pin = A2;  // motor 2 manual speed
+const int pot1Pin = A2;  // motor 1 manual speed
+const int pot2Pin = A3;  // motor 2 manual speed
 
 // ---- Start interlock, both motor outputs stay at zero until SELECT is pressed once ----
 bool started = false;
@@ -228,8 +228,14 @@ void loop() {
     Serial.print(manualMode1 ? "MAN" : "AUTO");
     Serial.print(" | Angle: ");
     Serial.print(boomAngle);
+    Serial.print(" | Potval1: ");
+    Serial.print(analogRead(pot1Pin));
+    Serial.print(" | Potval2: ");
+    Serial.print(analogRead(pot2Pin));
     Serial.print(" | Mode2: ");
-    Serial.println(manualMode2 ? "MAN" : "AUTO");
+    Serial.print(manualMode2 ? "MAN" : "AUTO");
+    Serial.print(" | Moto2 PWM: ");
+    Serial.println(motor2PWM);
 
     lastCalcTime = millis();
   }
