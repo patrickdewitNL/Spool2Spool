@@ -36,10 +36,22 @@ const int motor2PwmPin = 11;  // motor 2, angle controlled
 
 // ---- Encoder / hall pulse pin (motor 1 speed feedback) ----
 const int encoderPin = 2;     // hardware interrupt pin
-volatile unsigned long pulseCount = 0;
+volatile unsigned long pulseCount = 0;          // lifetime count, diagnostics only
+volatile unsigned long lastPulseMicros = 0;     // micros() at the most recent pulse
+volatile unsigned long pulsePeriodMicros = 0;   // time between the last two pulses
+// no pulse for this long -> treat as stopped rather than let the RPM estimate decay forever
+const unsigned long stalledTimeoutMicros = 10000000UL;  // 10s, ~2x the slowest expected pulse interval
 unsigned long lastCalcTime = 0;
 float currentRPM = 0;
-float currentLinearSpeed = 0;  // m/min, derived from currentRPM and spoolDiameterMM, for display only
+float currentLinearSpeed = 0;  // m/min, derived from the smoothed RPM and spoolDiameterMM, for display only
+
+// ---- Speed display smoothing ----
+// currentRPM (used by the P-controller above) stays raw/unfiltered on purpose, so this only
+// smooths what's shown on the LCD/serial, it doesn't change motor control response.
+const int speedAvgSamples = 5;  // ~5 seconds of smoothing at the once-per-second update rate
+float speedAvgBuffer[speedAvgSamples] = {0};
+int speedAvgIndex = 0;
+int speedAvgCount = 0;  // samples recorded so far, caps at speedAvgSamples
 
 // ---- Manual override potentiometers ----
 const int pot1Pin = A2;  // motor 1 manual speed
@@ -91,6 +103,9 @@ int readLCDButton() {
 int lastButton = -1;
 
 void countPulse() {
+  unsigned long now = micros();
+  pulsePeriodMicros = now - lastPulseMicros;
+  lastPulseMicros = now;
   pulseCount++;
 }
 
@@ -204,12 +219,34 @@ void loop() {
 
   if (millis() - lastCalcTime >= 1000) {
     noInterrupts();
-    unsigned long count = pulseCount;
-    pulseCount = 0;
+    unsigned long period = pulsePeriodMicros;
+    unsigned long lastPulse = lastPulseMicros;
     interrupts();
 
-    currentRPM = count * 60.0;  // change multiplier if more than 1 pulse per revolution
-    currentLinearSpeed = currentRPM * PI * (spoolDiameterMM / 1000.0);  // m/min
+    unsigned long sinceLastPulse = micros() - lastPulse;
+
+    if (lastPulse == 0 || sinceLastPulse > stalledTimeoutMicros) {
+      // no pulse yet, or it's been way longer than a normal interval -> genuinely stopped
+      currentRPM = 0;
+    } else {
+      // use whichever is longer: the last measured interval, or how long it's been since
+      // that pulse — so the estimate keeps easing down every second if the shaft is
+      // slowing, instead of freezing at the last (higher) reading until the next pulse
+      unsigned long effectivePeriod = max(period, sinceLastPulse);
+      currentRPM = 60000000.0 / effectivePeriod;  // change multiplier if more than 1 pulse per rev
+    }
+
+    // moving average over the last speedAvgSamples RPM readings, smooths the displayed
+    // speed so it eases toward 0 instead of snapping there the instant pulses stop
+    speedAvgBuffer[speedAvgIndex] = currentRPM;
+    speedAvgIndex = (speedAvgIndex + 1) % speedAvgSamples;
+    if (speedAvgCount < speedAvgSamples) speedAvgCount++;
+
+    float rpmSum = 0;
+    for (int i = 0; i < speedAvgCount; i++) rpmSum += speedAvgBuffer[i];
+    float avgRPM = rpmSum / speedAvgCount;
+
+    currentLinearSpeed = avgRPM * PI * (spoolDiameterMM / 1000.0);  // m/min, smoothed
 
     if (!manualMode1) {
       float error = targetRPM - currentRPM;
