@@ -72,12 +72,20 @@ A handful of constants at the top of the sketch are meant to be tuned on the ben
   motion is measured
 - `USE_MPU6050` — set to `1` once the MPU6050 is wired to A4/A5
 
-## Known open items
+## TODO
 
-- `Kp` needs tuning against the real motor/load once motor 1 is running
-- Once the MPU6050 is wired up, confirm whether `getAngleX()` or `getAngleY()` matches the
-  physical mounting orientation
-- `angleMin`/`angleMax` need to be set from the boom's actual range of motion
-- LCD shield button debounce is edge-detection only (no time-based debounce yet)
-- Motor 1's correction loop runs once per second; may need a shorter interval if RPM swings
-  under real load correct too slowly
+Firmware:
+
+- [ ] Tune `Kp` against the real motor/load once motor 1 is running
+- [ ] Once the MPU6050 is wired up, confirm whether `getAngleX()` or `getAngleY()` matches the
+      physical mounting orientation
+- [ ] Set `angleMin`/`angleMax` from the boom's actual range of motion
+- [ ] LCD shield button debounce is edge-detection only, no time-based debounce yet
+- [ ] Motor 1's correction loop runs once per second; may need a shorter interval if RPM swings
+      under real load correct too slowly
+
+Hardware:
+
+- [ ] Design a housing for the angle sensor (MPU6050)
+- [ ] Design a holder for the pulse counter (hall sensor)
+- [ ] Design the overall case
