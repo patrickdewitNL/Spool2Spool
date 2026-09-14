@@ -4,6 +4,29 @@ Arduino Uno firmware for a dual-motor boom/tension controller, driving two 24V g
 motors through BTS7960/IBT-2 drivers and a DFRobot LCD Keypad Shield for local control and
 readout.
 
+## Planned controller change (in progress)
+
+Everything below describes the **current, working** Arduino Uno + DFRobot LCD Keypad Shield
+implementation. That's being replaced — the Uno's pins were running out (motors, pots, hall
+sensor, I2C for a boom-mounted sensor, and a serial link all competing for ~20 pins), and
+running I2C to the MPU6050 over the ~1.5m cable to the boom, alongside the motor driver
+wiring, wasn't reliable enough to trust.
+
+New architecture (parts ordered, firmware not yet migrated):
+
+- **Main controller**: ESP-WROOM-32 module, replacing the Uno. Far more GPIOs, 3.3V logic
+  throughout.
+- **Display**: I2C LCD (ordered), replacing the DFRobot shield's parallel-interface LCD —
+  frees up the pins the shield used to occupy.
+- **Buttons**: the shield's built-in 5-button resistor ladder goes away with the shield.
+  Replacement not yet decided (discrete buttons per GPIO vs. an I2C keypad breakout).
+- **Boom angle sensor**: a separate **Wemos D1 mini** now sits right next to the MPU6050, so
+  I2C stays a few cm instead of 1.5m, and relays the angle back to the ESP-WROOM-32. Link
+  method (serial vs. WiFi/ESP-NOW) not yet finalized.
+
+None of this is reflected in `spool2spool.ino` yet. See the TODO list at the bottom for the
+concrete steps still open.
+
 ## What it does
 
 - **Motor 1** runs at a constant target speed, closed loop, using pulse feedback from a
@@ -86,6 +109,18 @@ Firmware:
 
 Hardware:
 
-- [ ] Design a housing for the angle sensor (MPU6050)
+- [ ] Design a housing for the angle sensor (MPU6050 + Wemos D1 mini together)
 - [ ] Design a holder for the pulse counter (hall sensor)
-- [ ] Design the overall case
+- [ ] Design the overall case (now needs to fit the ESP-WROOM-32 + I2C LCD instead of the
+      Uno + shield)
+
+Controller migration (Uno + shield -> ESP-WROOM-32 + I2C LCD):
+
+- [ ] Decide the button/keypad approach for the ESP-WROOM-32 build (discrete GPIOs vs. I2C
+      keypad breakout)
+- [ ] Decide the link between the Wemos D1 mini and the ESP-WROOM-32 (serial vs. WiFi/ESP-NOW)
+- [ ] Write the Wemos D1 mini firmware: read the MPU6050, send the angle over the chosen link
+- [ ] Port `spool2spool.ino`'s logic to the ESP-WROOM-32: 3.3V pot wiring, verify the BTS7960
+      modules' logic input accepts 3.3V, swap `LiquidCrystal` for an I2C LCD library, receive
+      the angle from the Wemos D1 mini instead of reading the MPU6050 directly
+- [ ] Update this README's Hardware/Pin mapping/Libraries sections once the migration lands
