@@ -20,35 +20,41 @@ New architecture (parts ordered, firmware not yet migrated):
   frees up the pins the shield used to occupy.
 - **Buttons**: the shield's built-in 5-button resistor ladder goes away with the shield.
   Replacement not yet decided (discrete buttons per GPIO vs. an I2C keypad breakout).
-- **Boom angle sensor**: a separate **Wemos D1 mini** now sits right next to the MPU6050, so
-  I2C stays a few cm instead of 1.5m, and relays the angle back to the ESP-WROOM-32 over a
-  bidirectional serial link (decided over WiFi/ESP-NOW — simpler, and both boards are 3.3V so
-  no level shifting is needed either way).
+- **Boom angle sensor**: a separate **Wemos D1 mini** with an **AS5600** magnetic angle sensor
+  (switched from the MPU6050) sits right at the boom pivot, so I2C stays a few cm instead of
+  1.5m, and actively pushes the angle back to the ESP-WROOM-32 over a one-way serial link
+  whenever it changes by more than 1° — no request/response needed, and both boards are 3.3V
+  so no level shifting either way.
 
 None of this is reflected in `spool2spool.ino` yet. See the TODO list at the bottom for the
 concrete steps still open.
 
 ### Wemos D1 mini angle-sensor node
 
-First-draft firmware: [`WemosAngleSensor/WemosAngleSensor.ino`](WemosAngleSensor/WemosAngleSensor.ino).
-Not yet bench-tested. The ESP-WROOM-32 is the master — it sends a single request byte (`'A'`),
-the Wemos replies with the current angle as ASCII text followed by a newline (e.g. `"18.3\n"`).
-Anything else received is ignored, so noise on the line can't trigger a spurious reply.
+Firmware: [`WemosAngleSensor/WemosAngleSensor.ino`](WemosAngleSensor/WemosAngleSensor.ino) —
+**finalized**. Reads the AS5600 continuously and sends a line (e.g. `"123.4\n"`) over Serial
+only when the angle has moved more than 1 degree since the last one sent. Purely one-way
+(Wemos -> ESP32) — nothing is requested or read back.
 
 | Wemos pin | Function |
 |-----------|----------|
-| D1 (GPIO5) | MPU6050 SCL |
-| D2 (GPIO4) | MPU6050 SDA |
-| RX | Data in, from the ESP32's TX |
+| D1 (GPIO5) | AS5600 SCL |
+| D2 (GPIO4) | AS5600 SDA |
 | TX | Data out, to the ESP32's RX |
 | 5V | Power in, from the ESP32 devkit's 5V/VIN pin |
-| 3V3 | Powers the MPU6050 — not the incoming 5V, keeps the sensor on the same 3.3V rail as the I2C logic |
+| 3V3 | Powers the AS5600 — not the incoming 5V, keeps the sensor on the same 3.3V rail as the I2C logic |
 | GND | Common ground, shared with the ESP32 and the cable shield |
+
+The AS5600's DIR pin ties to GND (or VCC — either works, just don't leave it floating); GPO is
+unused since only I2C is needed here.
 
 Cable: shielded twisted-pair (e.g. STP/FTP Cat5e/6) for the ~1.5m run to the boom — one pair
 for data + GND (twisted together for a tight signal reference), one pair (or two, paralleled,
 for lower resistance) for power + GND. Ground the shield at the ESP32 end only, to avoid a
 ground loop.
+
+A separate standalone MVP for bench-testing an AS5600 on an ESP32 directly (not the Wemos link)
+lives in [`AS5600Test/AS5600Test.ino`](AS5600Test/AS5600Test.ino).
 
 ## What it does
 
@@ -132,18 +138,19 @@ Firmware:
 
 Hardware:
 
-- [ ] Design a housing for the angle sensor (MPU6050 + Wemos D1 mini together)
+- [ ] Design a housing for the angle sensor (AS5600 + Wemos D1 mini together)
 - [ ] Design a holder for the pulse counter (hall sensor)
 - [ ] Design the overall case (now needs to fit the ESP-WROOM-32 + I2C LCD instead of the
       Uno + shield)
+- [ ] Pick up a piece of DIN rail (or two) — 2026-09-15
 
 Controller migration (Uno + shield -> ESP-WROOM-32 + I2C LCD):
 
 - [ ] Decide the button/keypad approach for the ESP-WROOM-32 build (discrete GPIOs vs. I2C
       keypad breakout)
-- [x] Decide the link between the Wemos D1 mini and the ESP-WROOM-32 — bidirectional serial,
-      ESP32 as master (see "Wemos D1 mini angle-sensor node" above)
-- [ ] Bench-test `WemosAngleSensor/WemosAngleSensor.ino` (first draft written, not yet run)
+- [x] Decide the link between the Wemos D1 mini and the ESP-WROOM-32 — one-way active push
+      over serial whenever the angle changes >1° (see "Wemos D1 mini angle-sensor node" above)
+- [x] `WemosAngleSensor/WemosAngleSensor.ino` — finalized (AS5600, active push on >1° change)
 - [ ] Port `spool2spool.ino`'s logic to the ESP-WROOM-32: 3.3V pot wiring, verify the BTS7960
       modules' logic input accepts 3.3V, swap `LiquidCrystal` for an I2C LCD library, receive
       the angle from the Wemos D1 mini instead of reading the MPU6050 directly
