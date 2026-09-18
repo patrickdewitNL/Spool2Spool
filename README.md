@@ -1,46 +1,77 @@
 # Spool2Spool Controller
 
-Arduino Uno firmware for a dual-motor boom/tension controller, driving two 24V geared DC
-motors through BTS7960/IBT-2 drivers and a DFRobot LCD Keypad Shield for local control and
-readout.
+Dual-motor boom/tension controller: an ESP-WROOM-32 devkit driving two 24V geared DC motors
+through BTS7960/IBT-2 drivers, with an I2C LCD for local readout/control and a separate
+Wemos D1 mini node reading the boom angle right at the pivot.
 
-## Planned controller change (in progress)
+## What it does
 
-Everything below describes the **current, working** Arduino Uno + DFRobot LCD Keypad Shield
-implementation. That's being replaced — the Uno's pins were running out (motors, pots, hall
-sensor, I2C for a boom-mounted sensor, and a serial link all competing for ~20 pins), and
-running I2C to the MPU6050 over the ~1.5m cable to the boom, alongside the motor driver
-wiring, wasn't reliable enough to trust.
+- **Motor 1** runs at a constant target speed, closed loop, using pulse feedback from a
+  hall sensor/encoder on its shaft. A proportional controller corrects the PWM duty once per
+  second. Speed is displayed as line speed in m/min, computed from the measured RPM and the
+  spool diameter (adjustable live from the buttons).
+- **Motor 2** follows the boom's angle. The angle itself is measured by an AS5600 magnetic
+  sensor mounted right at the boom pivot, read by a separate Wemos D1 mini, and pushed to the
+  ESP32 over a one-way serial link — see
+  [Wemos D1 mini angle-sensor node](#wemos-d1-mini-angle-sensor-node) below.
+- Both motors support **manual override**, driving speed directly from a potentiometer instead
+  of the automatic logic.
+- Both motor outputs stay at **zero on power-up** until SELECT is pressed once.
+- Local UI: LEFT/RIGHT toggle manual/auto mode per motor, UP/DOWN adjust the spool diameter
+  used for the speed readout, SELECT starts the system, and the 20x4 I2C LCD shows an
+  "EMI Twente" splash screen at boot, a "press SELECT to start" prompt, then live speed/mode1
+  on the top two lines and angle/mode2 on the bottom two.
 
-New architecture (parts ordered, firmware not yet migrated):
+## Hardware
 
-- **Main controller**: ESP-WROOM-32 module, replacing the Uno. Far more GPIOs, 3.3V logic
-  throughout.
-- **Display**: I2C LCD (ordered), replacing the DFRobot shield's parallel-interface LCD —
-  frees up the pins the shield used to occupy.
-- **Buttons**: the shield's built-in 5-button resistor ladder goes away with the shield.
-  Replacement not yet decided (discrete buttons per GPIO vs. an I2C keypad breakout).
-- **Boom angle sensor**: a separate **Wemos D1 mini** with an **AS5600** magnetic angle sensor
-  (switched from the MPU6050) sits right at the boom pivot, so I2C stays a few cm instead of
-  1.5m, and actively pushes the angle back to the ESP-WROOM-32 over a one-way serial link
-  whenever it changes by more than 1° — no request/response needed, and both boards are 3.3V
-  so no level shifting either way.
+- ESP-WROOM-32 devkit (30-pin), 3.3V logic throughout
+- 20x4 I2C LCD (PCF8574-based backpack, address 0x27 or 0x3F depending on the module)
+- 5 discrete pushbuttons (LEFT/RIGHT/UP/DOWN/SELECT), each to GND, using the ESP32's internal
+  pull-ups — no external resistors, no resistor-ladder shield
+- 2x 24V geared DC motors, each driven through a BTS7960/IBT-2 module (PWM speed control only,
+  R_EN/L_EN tied high in hardware, no direction control needed)
+- Hall sensor/encoder on motor 1's shaft, 1 pulse per revolution, interrupt driven
+- 2x potentiometers for manual speed override, one per motor
+- A separate **Wemos D1 mini + AS5600** node mounted at the boom pivot, sending the angle over
+  a serial link (see below) — no angle sensor lives on the ESP32 board itself
 
-None of this is reflected in `spool2spool.ino` yet. See the TODO list at the bottom for the
-concrete steps still open.
+## Pin mapping
 
-### Wemos D1 mini angle-sensor node
+| ESP32 pin | Function |
+|-----------|----------|
+| GPIO21 | I2C SDA — LCD |
+| GPIO22 | I2C SCL — LCD |
+| GPIO16 | Serial2 RX — angle data in, from the Wemos D1 mini's TX |
+| GPIO17 | Serial2 TX — unused (the link is one-way, Wemos never listens) |
+| GPIO25 | Motor 1 PWM output |
+| GPIO26 | Motor 2 PWM output |
+| GPIO4  | Hall sensor / encoder pulse input (interrupt) |
+| GPIO34 | Motor 1 manual override potentiometer (ADC1-only pin) |
+| GPIO35 | Motor 2 manual override potentiometer (ADC1-only pin) |
+| GPIO13 | Button: LEFT |
+| GPIO27 | Button: RIGHT |
+| GPIO32 | Button: UP |
+| GPIO33 | Button: DOWN |
+| GPIO14 | Button: SELECT |
 
-Firmware: [`WemosAngleSensor/WemosAngleSensor.ino`](WemosAngleSensor/WemosAngleSensor.ino) —
-**finalized**. Reads the AS5600 continuously and sends a line (e.g. `"123.4\n"`) over Serial
-only when the angle has moved more than 1 degree since the last one sent. Purely one-way
-(Wemos -> ESP32) — nothing is requested or read back.
+Potentiometers are on ADC1-only pins deliberately — ADC2 conflicts with Wi-Fi on the ESP32, so
+manual-override reads stay reliable even if Wi-Fi is ever enabled. Any interrupt-capable GPIO
+works for the encoder; GPIO4 is just what's wired today.
+
+## Wemos D1 mini angle-sensor node
+
+Firmware: [`software/WemosAngleSensor/WemosAngleSensor.ino`](software/WemosAngleSensor/WemosAngleSensor.ino) —
+**finalized**. Reads an AS5600 magnetic angle sensor continuously and sends a line (e.g.
+`"123.4\n"`) over its hardware serial only when the angle has moved more than 1 degree since
+the last one sent. Purely one-way (Wemos -> ESP32), 9600 baud — nothing is requested or read
+back, and the ESP32 side (`software/spool2spool-esp32`) just listens on Serial2 (GPIO16) and
+keeps the last value it received.
 
 | Wemos pin | Function |
 |-----------|----------|
 | D1 (GPIO5) | AS5600 SCL |
 | D2 (GPIO4) | AS5600 SDA |
-| TX | Data out, to the ESP32's RX |
+| TX | Data out, to the ESP32's GPIO16 (Serial2 RX) |
 | 5V | Power in, from the ESP32 devkit's 5V/VIN pin |
 | 3V3 | Powers the AS5600 — not the incoming 5V, keeps the sensor on the same 3.3V rail as the I2C logic |
 | GND | Common ground, shared with the ESP32 and the cable shield |
@@ -48,110 +79,67 @@ only when the angle has moved more than 1 degree since the last one sent. Purely
 The AS5600's DIR pin ties to GND (or VCC — either works, just don't leave it floating); GPO is
 unused since only I2C is needed here.
 
-Cable: shielded twisted-pair (e.g. STP/FTP Cat5e/6) for the ~1.5m run to the boom — one pair
-for data + GND (twisted together for a tight signal reference), one pair (or two, paralleled,
-for lower resistance) for power + GND. Ground the shield at the ESP32 end only, to avoid a
-ground loop.
-
-A separate standalone MVP for bench-testing an AS5600 on an ESP32 directly (not the Wemos link)
-lives in [`AS5600Test/AS5600Test.ino`](AS5600Test/AS5600Test.ino).
-
-## What it does
-
-- **Motor 1** runs at a constant target speed, closed loop, using pulse feedback from a
-  hall sensor/encoder on its shaft. A proportional controller corrects the PWM duty once per
-  second. Speed is displayed as line speed in m/min, computed from the measured RPM and the
-  spool diameter (adjustable live from the shield).
-- **Motor 2** follows the boom's angle, read from an MPU6050 tilt sensor over I2C. Until the
-  sensor is physically wired up, the angle is simulated with a sine sweep so the mapping logic
-  and display can be tested without the hardware present.
-- Both motors support **manual override**, driving speed directly from a potentiometer instead
-  of the automatic logic.
-- Both motor outputs stay at **zero on power-up** until SELECT is pressed once on the shield.
-- The **DFRobot LCD Keypad Shield** provides local UI: LEFT/RIGHT toggle manual/auto mode per
-  motor, UP/DOWN adjust the spool diameter used for the speed readout, SELECT starts the system,
-  and the 16x2 LCD shows an "EMI Twente" splash screen at boot, a "press SELECT to start" prompt,
-  then live speed/angle/mode.
-
-## Hardware
-
-- Arduino Uno
-- DFRobot LCD Keypad Shield (16x2 LCD, 5 buttons on a single analog pin, parallel LCD interface)
-- 2x 24V geared DC motors, each driven through a BTS7960/IBT-2 module (PWM speed control only,
-  R_EN/L_EN tied high in hardware, no direction control needed)
-- Hall sensor/encoder on motor 1's shaft, 1 pulse per revolution, interrupt driven
-- MPU6050 accelerometer/gyro, bolted to the boom body as a tilt/inclinometer (I2C) — **not yet
-  physically wired up**; stubbed out behind the `USE_MPU6050` compile-time flag
-- 2x potentiometers for manual speed override, one per motor
-
-## Pin mapping
-
-The LCD shield occupies pins 4, 5, 6, 7, 8, 9, 10 (parallel LCD interface + backlight) and A0
-(button ladder, analog read).
-
-| Pin | Function |
-|-----|----------|
-| 2   | Hall sensor / encoder pulse input (INT0, hardware interrupt) |
-| 3   | Motor 1 PWM output |
-| 11  | Motor 2 PWM output |
-| A2  | Motor 1 manual override potentiometer |
-| A3  | Motor 2 manual override potentiometer |
-| A4 / A5 | I2C (SDA/SCL) for the MPU6050, once connected |
-
-Free/unused: pins 12, 13, A1.
+Cable: simple 4-conductor wire for the ~1.5m run to the boom — one conductor for data, one for
+power, two for GND (data GND and power GND, or just double up one GND conductor for lower
+resistance). No twisted pair or shielding in use — not needed here, since a slow (9600 baud),
+one-way UART link tolerates a plain cable run far better than I2C ever did over this distance,
+which is why the angle sensor moved off I2C entirely in this architecture.
 
 ## Libraries
 
-- `LiquidCrystal.h` — built in
 - `Wire.h` — built in
-- [`MPU6050_light`](https://github.com/rfetick/MPU6050_light) by rfetick — install via the
-  Arduino Library Manager, only needed once `USE_MPU6050` is set to `1`
+- `LiquidCrystal_I2C` — install via the Arduino Library Manager ("LiquidCrystal I2C"); needs
+  a `begin(cols, rows)` variant, e.g. the DFRobot/Marco Schwartz-style fork most Library
+  Manager searches return (the WARNING about it claiming "all architectures" is expected and
+  harmless on ESP32)
+- `AS5600` by Rob Tillaart — install via the Arduino Library Manager, needed only for the
+  **Wemos** sketch, not the ESP32 sketch
 
 ## Building / flashing
 
-Open `Spool2Spool/spool2spool.ino` in the Arduino IDE, select **Arduino Uno** as the board,
-install the `MPU6050_light` library if `USE_MPU6050` is enabled, and upload.
+**ESP32 main controller**: open
+[`software/spool2spool-esp32/spool2spool-esp32.ino`](software/spool2spool-esp32/spool2spool-esp32.ino)
+in the Arduino IDE, select an ESP32 Dev Module board (arduino-esp32 core 3.x — needed for
+`analogWrite()` support), install `LiquidCrystal_I2C`, and upload.
+
+**Wemos angle-sensor node**: open
+[`software/WemosAngleSensor/WemosAngleSensor.ino`](software/WemosAngleSensor/WemosAngleSensor.ino),
+select a Wemos D1 mini (ESP8266) board, install `AS5600`, and upload.
 
 ## Configuration
 
-A handful of constants at the top of the sketch are meant to be tuned on the bench:
+A handful of constants at the top of `spool2spool-esp32.ino` are meant to be tuned on the bench:
 
 - `targetRPM` — motor 1's target speed
 - `Kp` — motor 1's proportional gain, untested starting guess
 - `spoolDiameterMM` — motor 1 spool diameter used for the m/min readout (also adjustable live via
-  the shield's UP/DOWN buttons; does not persist across power cycles)
+  UP/DOWN; does not persist across power cycles)
 - `angleMin` / `angleMax` — motor 2's boom angle range, placeholders until the real range of
   motion is measured
-- `USE_MPU6050` — set to `1` once the MPU6050 is wired to A4/A5
+- `0x27` (LCD I2C address, in the `lcd()` constructor) — change to `0x3F` if the display stays
+  blank, or run an I2C scanner sketch to confirm
+
+On the Wemos side, `changeThresholdDeg` in `WemosAngleSensor.ino` sets how far the angle has to
+move before a new reading is sent.
 
 ## TODO
 
 Firmware:
 
 - [ ] Tune `Kp` against the real motor/load once motor 1 is running
-- [ ] Once the MPU6050 is wired up, confirm whether `getAngleX()` or `getAngleY()` matches the
-      physical mounting orientation
 - [ ] Set `angleMin`/`angleMax` from the boom's actual range of motion
-- [ ] LCD shield button debounce is edge-detection only, no time-based debounce yet
+- [ ] Confirm the AS5600's mounting orientation on the boom matches the sign/direction expected
+      by `angleMin`/`angleMax` (`setDirection()` in `WemosAngleSensor.ino` flips it if needed)
+- [ ] Button debounce is edge-detection only, no time-based debounce yet
 - [ ] Motor 1's correction loop runs once per second; may need a shorter interval if RPM swings
       under real load correct too slowly
+- [ ] Real compile verification of `spool2spool-esp32.ino` via arduino-cli is still outstanding —
+      blocked so far by a network policy restriction, not yet re-attempted
 
 Hardware:
 
 - [ ] Design a housing for the angle sensor (AS5600 + Wemos D1 mini together)
 - [ ] Design a holder for the pulse counter (hall sensor)
-- [ ] Design the overall case (now needs to fit the ESP-WROOM-32 + I2C LCD instead of the
-      Uno + shield)
+- [ ] Design the overall case (ESP-WROOM-32 + I2C LCD + 5 buttons)
 - [ ] Pick up a piece of DIN rail (or two) — 2026-09-15
-
-Controller migration (Uno + shield -> ESP-WROOM-32 + I2C LCD):
-
-- [ ] Decide the button/keypad approach for the ESP-WROOM-32 build (discrete GPIOs vs. I2C
-      keypad breakout)
-- [x] Decide the link between the Wemos D1 mini and the ESP-WROOM-32 — one-way active push
-      over serial whenever the angle changes >1° (see "Wemos D1 mini angle-sensor node" above)
-- [x] `WemosAngleSensor/WemosAngleSensor.ino` — finalized (AS5600, active push on >1° change)
-- [ ] Port `spool2spool.ino`'s logic to the ESP-WROOM-32: 3.3V pot wiring, verify the BTS7960
-      modules' logic input accepts 3.3V, swap `LiquidCrystal` for an I2C LCD library, receive
-      the angle from the Wemos D1 mini instead of reading the MPU6050 directly
-- [ ] Update this README's Hardware/Pin mapping/Libraries sections once the migration lands
+- [ ] Verify the BTS7960 modules' logic inputs accept 3.3V from the ESP32 directly
