@@ -2,7 +2,7 @@
   Dual motor control, Arduino Uno + DFRobot LCD Keypad Shield
   - Motor 1: closed loop constant speed via encoder/hall pulse feedback, with manual override
     (displayed as line speed in m/min, using the spool diameter set below)
-  - Motor 2: speed follows boom angle from MPU6050 (I2C), with manual override
+  - Motor 2: speed follows arm angle from MPU6050 (I2C), with manual override
   - Shield buttons: LEFT/RIGHT toggle manual/auto mode per motor, UP/DOWN adjust spool diameter,
     SELECT starts the system
   - Both motor outputs stay at zero after power up until SELECT is pressed once
@@ -80,7 +80,7 @@ unsigned long diameterDisplayUntil = 0;  // while in the future, LCD shows the d
 const unsigned long diameterDisplayDuration = 1500;
 
 // ---- Motor 2 angle mapping range ----
-// adjust these to match your boom's real min/max angle in degrees
+// adjust these to match your arm's real min/max angle in degrees
 const float angleMin = 0.0;
 const float angleMax = 90.0;
 int motor2PWM = 0;
@@ -130,9 +130,9 @@ void setup() {
   }
 
   lcd.clear();
-  lcd.print("Keep boom still");
+  lcd.print("Keep arm still");
   delay(1500);
-  mpu.calcOffsets();  // boom must be still and level during this step
+  mpu.calcOffsets();  // arm must be still and level during this step
 #else
   lcd.clear();
   lcd.print("DEMO: no MPU");
@@ -192,11 +192,11 @@ void loop() {
 
 #if USE_MPU6050
   mpu.update();
-  float boomAngle = mpu.getAngleY();  // check which axis matches your mounting
+  float armAngle = mpu.getAngleY();  // check which axis matches your mounting
 #else
   // fake angle, slowly sweeps between angleMin and angleMax so you can test
   // motor 2's auto mode logic and the LCD display without real hardware
-  float boomAngle = angleMin + (angleMax - angleMin) *
+  float armAngle = angleMin + (angleMax - angleMin) *
                      (0.5 + 0.5 * sin(millis() / 3000.0));
 #endif
 
@@ -205,7 +205,7 @@ void loop() {
     int potVal2 = analogRead(pot2Pin);
     motor2PWM = map(potVal2, 0, 1023, 0, 255);
   } else {
-    float clampedAngle = constrain(boomAngle, angleMin, angleMax);
+    float clampedAngle = constrain(armAngle, angleMin, angleMax);
     motor2PWM = map((long)clampedAngle, (long)angleMin, (long)angleMax, 0, 255);
   }
   analogWrite(motor2PwmPin, motor2PWM);
@@ -264,7 +264,7 @@ void loop() {
     Serial.print(" | Mode1: ");
     Serial.print(manualMode1 ? "MAN" : "AUTO");
     Serial.print(" | Angle: ");
-    Serial.print(boomAngle);
+    Serial.print(armAngle);
     Serial.print(" | Potval1: ");
     Serial.print(analogRead(pot1Pin));
     Serial.print(" | Potval2: ");
@@ -297,7 +297,7 @@ void loop() {
 
       lcd.setCursor(0, 1);
       lcd.print("Ang:");
-      lcd.print(boomAngle, 1);
+      lcd.print(armAngle, 1);
       lcd.print("   ");
       lcd.setCursor(13, 1);
       lcd.print("M2");

@@ -6,14 +6,20 @@
   without the shield; the button/keypad approach was still open in the README TODO,
   discrete GPIOs is the simplest default and easy to swap for an I2C keypad later).
 
-  - Motor 1: closed loop constant speed via encoder/hall pulse feedback, with manual override
-    (displayed as line speed in m/min, using the spool diameter set below)
-  - Motor 2: speed follows the boom angle, received over Serial2 from the Wemos D1 mini
-    angle-sensor node (software/WemosAngleSensor — AS5600 next to the boom pivot). No I2C
-    angle sensor on this board at all; the MPU6050 direct-I2C code from the Arduino version
-    is gone, replaced by this serial link.
-  - Buttons: LEFT/RIGHT toggle manual/auto mode per motor, UP/DOWN adjust spool diameter,
-    SELECT starts the system
+  - Motor 2 has the only encoder/hall sensor: closed loop constant speed control, target
+    set live as a speed in m/min (converted to RPM via the spool diameter). Pot 2 sets this
+    target speed continuously in auto mode, and drives the PWM directly (open loop) in
+    manual mode -- same knob, same feel, different meaning depending on mode.
+  - Motor 1 has no encoder of its own, so its baseline PWM continuously tracks motor 2's
+    PWM (keeping both motors nominally speed-matched), fine-tuned by a small proportional
+    correction based on the arm angle -- received over Serial2 from the Wemos D1 mini
+    angle-sensor node (software/WemosAngleSensor — AS5600 next to the arm pivot) -- holding
+    that angle at a live-adjustable target. The angle term is deliberately a small trim on
+    top of the motor-2-tracking baseline, not the primary driver: the angle reading is
+    noisy/unreliable right at startup, so a bad first reading can only nudge motor 1 a
+    little, never throw it far from motor 2's PWM.
+  - Buttons: LEFT/RIGHT toggle manual/auto mode per motor. SELECT starts the system, then
+    (once started) cycles what UP/DOWN adjusts: spool diameter, then motor 1's target angle.
   - Both motor outputs stay at zero after power up until SELECT is pressed once
   - LCD shows an "EMI Twente" splash screen at boot, then a "press SELECT to start" prompt,
     then live speed/angle/mode
@@ -51,10 +57,10 @@
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
 // ---- Motor pins ----
-const int motor1PwmPin = 25;  // motor 1, closed loop RPM control
-const int motor2PwmPin = 26;  // motor 2, angle controlled
+const int motor1PwmPin = 25;  // motor 1, no encoder -- tracks motor 2's PWM, fine-tuned by arm angle
+const int motor2PwmPin = 26;  // motor 2, closed loop RPM control (this motor has the encoder)
 
-// ---- Encoder / hall pulse pin (motor 1 speed feedback) ----
+// ---- Encoder / hall pulse pin (motor 2 speed feedback -- the only encoder in this system) ----
 const int encoderPin = 4;     // interrupt capable — any GPIO works on ESP32
 volatile unsigned long pulseCount = 0;          // lifetime count, diagnostics only
 volatile unsigned long lastPulseMicros = 0;     // micros() at the most recent pulse
@@ -73,9 +79,10 @@ float speedAvgBuffer[speedAvgSamples] = {0};
 int speedAvgIndex = 0;
 int speedAvgCount = 0;  // samples recorded so far, caps at speedAvgSamples
 
-// ---- Manual override potentiometers ----
+// ---- Potentiometers ----
 const int pot1Pin = 34;  // motor 1 manual speed (ADC1-only pin)
-const int pot2Pin = 35;  // motor 2 manual speed (ADC1-only pin)
+const int pot2Pin = 35;  // motor 2: manual PWM in manual mode, target speed setpoint in
+                          // auto mode -- same knob, different meaning (ADC1-only pin)
 
 // ---- Buttons (discrete GPIOs, internal pull-up, pressed = LOW) ----
 const int btnLeftPin   = 13;
@@ -91,32 +98,50 @@ bool started = false;
 bool manualMode1 = false;
 bool manualMode2 = false;
 
-// ---- Motor 1 closed loop control ----
-float targetRPM = 1200.0;     // set your target speed here
-int motor1PWM = 128;          // starting point, self adjusts
-const float Kp = 0.5;         // tune on the bench, raise if slow to correct, lower if it hunts
+// ---- Motor 2 closed loop speed control -- target set live from pot2 in auto mode (see
+// loop()), converted to RPM below using the spool diameter ----
+float targetSpeedMPM = 5.0;             // m/min, set from pot2 every loop while in auto mode
+const float speedMinMPM = 0.0;
+const float speedMaxMPM = 10.0;
+int motor2PWM = 0;                      // starting point, self adjusts -- overwritten in setup()
+                                         // from pot2's actual reading, not a hardcoded guess
+const float Kp = 3.0;                   // raised from 0.5 -- that crawled toward setpoint over
+                                         // ~20s for a full-range error; some overshoot is fine,
+                                         // keep raising if still slow, lower if it starts hunting
 
-// ---- Motor 1 spool, for converting RPM to line speed for the display ----
+// ---- Motor 1's angle range -- adjust to match your arm's real min/max angle in degrees ----
+const float angleMin = 0.0;
+const float angleMax = 350.0;
+
+// ---- Motor 1 tracks motor 2's PWM (no encoder of its own), fine-tuned by arm angle ----
+float targetAngleDeg = 90.0;            // placeholder, adjust for your setup -- live-adjustable
+const float angleStepDeg = 0.1;
+const float KpAngle = 1.0;              // deliberately modest -- this is a fine trim, not the primary driver
+const int angleTrimLimitPWM = 40;       // caps how far the angle trim can push motor 1 away from
+                                         // motor 2's PWM, so a noisy/garbage angle reading (e.g.
+                                         // before the Wemos's first line ever arrives) can't swing it far
+int motor1PWM = 0;  // overwritten in setup() from pot1's actual reading, not a hardcoded guess
+
+// ---- Spool, for converting RPM <-> line speed (motor 2's target and the display) ----
 // UP/DOWN adjust this live, e.g. to match whatever spool is currently loaded
 // NOTE: this does not persist across power cycles, resets to the placeholder below on reset
-float spoolDiameterMM = 50.0;  // placeholder, adjust for the real spool on the bench
+float spoolDiameterMM = 20.0;  // placeholder, adjust for the real spool on the bench
 const float spoolDiameterStepMM = 1.0;
 const float spoolDiameterMinMM = 5.0;
 const float spoolDiameterMaxMM = 300.0;
-unsigned long diameterDisplayUntil = 0;  // while in the future, LCD shows the diameter instead of normal telemetry
-const unsigned long diameterDisplayDuration = 1500;
 
-// ---- Motor 2 angle mapping range ----
-// adjust these to match your boom's real min/max angle in degrees
-const float angleMin = 0.0;
-const float angleMax = 90.0;
-int motor2PWM = 0;
+// ---- cycles which of the 2 values above UP/DOWN currently adjusts -- SELECT advances this
+// once the system has started (before that, SELECT starts it instead). Motor 2's target
+// speed isn't in this cycle -- pot2 sets that continuously in auto mode instead. ----
+int adjustTarget = 0;  // 0 = spool diameter, 1 = motor 1 target angle
+unsigned long adjustDisplayUntil = 0;  // while in the future, LCD shows the adjusted value instead of normal telemetry
+const unsigned long adjustDisplayDuration = 1500;
 
-// ---- Boom angle, received from the Wemos D1 mini angle-sensor node over Serial2 ----
+// ---- Arm angle, received from the Wemos D1 mini angle-sensor node over Serial2 ----
 // The Wemos only sends a new line when the angle has moved more than 1 degree (see
 // software/WemosAngleSensor), not on a fixed schedule — this just holds the last value
 // received until the next line comes in.
-float boomAngle = 0.0;
+float armAngle = 0.0;
 String angleLineBuffer = "";
 
 // ---- LCD refresh timing ----
@@ -151,14 +176,25 @@ void lcdPrintLine(int row, const char *text) {
   lcd.print(buf);
 }
 
-// non-blocking: drains whatever's waiting on Serial2 and updates boomAngle once a full
+// left text at column 0, right text flush against column 20 (e.g. a live reading on the
+// left, its setpoint right-aligned) -- if both together don't fit, right still gets at
+// least 1 space of separation and just gets clipped by lcdPrintLine's own 20-char truncation
+void lcdPrintLineRJ(int row, const char *left, const char *right) {
+  char buf[21];
+  int spaces = 20 - (int)strlen(left) - (int)strlen(right);
+  if (spaces < 1) spaces = 1;
+  snprintf(buf, sizeof(buf), "%s%*s", left, spaces + (int)strlen(right), right);
+  lcdPrintLine(row, buf);
+}
+
+// non-blocking: drains whatever's waiting on Serial2 and updates armAngle once a full
 // line has arrived. Never waits for more data, so this can't stall the main loop.
-void updateBoomAngleFromSerial() {
+void updateArmAngleFromSerial() {
   while (Serial2.available() > 0) {
     char c = Serial2.read();
     if (c == '\n') {
       if (angleLineBuffer.length() > 0) {
-        boomAngle = angleLineBuffer.toFloat();
+        armAngle = angleLineBuffer.toFloat();
       }
       angleLineBuffer = "";
     } else if (c != '\r') {
@@ -233,6 +269,11 @@ void setup() {
   analogWrite(motor1PwmPin, 0);
   analogWrite(motor2PwmPin, 0);
 
+  // seed the auto-mode PID starting points from wherever the pots actually are right now,
+  // instead of a hardcoded guess -- same inverted mapping as manual mode uses
+  motor1PWM = map(analogRead(pot1Pin), 0, 4095, 255, 0);
+  motor2PWM = map(analogRead(pot2Pin), 0, 4095, 255, 0);
+
   lastCalcTime = millis();
   Serial.println("=== setup() complete, entering loop() ===");
 }
@@ -240,7 +281,7 @@ void setup() {
 unsigned long lastWaitingDebug = 0;
 
 void loop() {
-  updateBoomAngleFromSerial();  // non-blocking; keeps boomAngle fresh whenever the Wemos sends
+  updateArmAngleFromSerial();  // non-blocking; keeps armAngle fresh whenever the Wemos sends
 
   // ---- both outputs stay at zero until SELECT has been pressed once ----
   if (!started) {
@@ -273,28 +314,41 @@ void loop() {
     if (btn == 3) manualMode1 = !manualMode1;  // LEFT toggles motor 1 mode
     if (btn == 0) manualMode2 = !manualMode2;  // RIGHT toggles motor 2 mode
 
-    if (btn == 1) {  // UP, increase spool diameter
-      spoolDiameterMM = min(spoolDiameterMM + spoolDiameterStepMM, spoolDiameterMaxMM);
-      diameterDisplayUntil = millis() + diameterDisplayDuration;
+    if (btn == 4) {  // SELECT (after start): cycle which value UP/DOWN adjusts
+      adjustTarget = (adjustTarget + 1) % 2;
+      adjustDisplayUntil = millis() + adjustDisplayDuration;
     }
-    if (btn == 2) {  // DOWN, decrease spool diameter
-      spoolDiameterMM = max(spoolDiameterMM - spoolDiameterStepMM, spoolDiameterMinMM);
-      diameterDisplayUntil = millis() + diameterDisplayDuration;
+
+    if (btn == 1) {  // UP
+      if (adjustTarget == 0) {
+        spoolDiameterMM = min(spoolDiameterMM + spoolDiameterStepMM, spoolDiameterMaxMM);
+      } else {
+        targetAngleDeg = min(targetAngleDeg + angleStepDeg, angleMax);
+      }
+      adjustDisplayUntil = millis() + adjustDisplayDuration;
+    }
+    if (btn == 2) {  // DOWN
+      if (adjustTarget == 0) {
+        spoolDiameterMM = max(spoolDiameterMM - spoolDiameterStepMM, spoolDiameterMinMM);
+      } else {
+        targetAngleDeg = max(targetAngleDeg - angleStepDeg, angleMin);
+      }
+      adjustDisplayUntil = millis() + adjustDisplayDuration;
     }
   }
   lastButton = btn;
 
-  // ---- motor 2: manual pot or angle mapping ----
+  // ---- motor 2: manual pot drives PWM directly, auto pot sets the target speed instead ----
+  int potVal2 = analogRead(pot2Pin);
   if (manualMode2) {
-    int potVal2 = analogRead(pot2Pin);
     motor2PWM = map(potVal2, 0, 4095, 255, 0);  // inverted: potVal 0 = full, 4095 = stop. ESP32 ADC is 12-bit (0-4095), not 10-bit like AVR
+    analogWrite(motor2PwmPin, motor2PWM);
   } else {
-    float clampedAngle = constrain(boomAngle, angleMin, angleMax);
-    motor2PWM = map((long)clampedAngle, (long)angleMin, (long)angleMax, 0, 255);
+    // same inverted feel as manual mode: 0 = max target speed, 4095 = stop
+    targetSpeedMPM = speedMaxMPM - (speedMaxMPM - speedMinMPM) * (potVal2 / 4095.0);
   }
-  analogWrite(motor2PwmPin, motor2PWM);
 
-  // ---- motor 1: manual pot, or closed loop RPM correction once per second ----
+  // ---- motor 1: manual pot override (auto = tracks motor 2's PWM + arm-angle trim, below) ----
   if (manualMode1) {
     int potVal1 = analogRead(pot1Pin);
     motor1PWM = map(potVal1, 0, 4095, 255, 0);  // inverted: potVal 0 = full, 4095 = stop. ESP32 ADC is 12-bit (0-4095), not 10-bit like AVR
@@ -332,10 +386,27 @@ void loop() {
 
     currentLinearSpeed = avgRPM * PI * (spoolDiameterMM / 1000.0);  // m/min, smoothed
 
-    if (!manualMode1) {
+    // ---- motor 2: closed loop, target speed converted to RPM via the spool diameter ----
+    if (!manualMode2) {
+      float targetRPM = targetSpeedMPM / (PI * (spoolDiameterMM / 1000.0));
       float error = targetRPM - currentRPM;
-      motor1PWM += (int)(Kp * error / 10);
-      motor1PWM = constrain(motor1PWM, 0, 255);
+      motor2PWM += (int)(Kp * error / 10);
+      motor2PWM = constrain(motor2PWM, 0, 255);
+      analogWrite(motor2PwmPin, motor2PWM);
+    }
+
+    // ---- motor 1: no encoder -- track motor 2's PWM, trimmed by arm angle error ----
+    if (!manualMode1) {
+      if (motor2PWM == 0) {
+        // motor 2 stopped (e.g. 0 m/min setpoint) -> motor 1 stops too, angle trim doesn't
+        // apply here: a positive trim on top of 0 would otherwise still spin motor 1
+        motor1PWM = 0;
+      } else {
+        float clampedAngle = constrain(armAngle, angleMin, angleMax);
+        float angleError = targetAngleDeg - clampedAngle;
+        int trim = constrain((int)(KpAngle * angleError), -angleTrimLimitPWM, angleTrimLimitPWM);
+        motor1PWM = constrain(motor2PWM + trim, 0, 255);
+      }
       analogWrite(motor1PwmPin, motor1PWM);
     }
 
@@ -343,20 +414,24 @@ void loop() {
     Serial.print(currentRPM);
     Serial.print(" | Speed(m/min): ");
     Serial.print(currentLinearSpeed);
+    Serial.print(" | TargetSpeed(m/min): ");
+    Serial.print(targetSpeedMPM);
+    Serial.print(" | Motor2 PWM: ");
+    Serial.print(motor2PWM);
+    Serial.print(" | Mode2: ");
+    Serial.print(manualMode2 ? "MAN" : "AUTO");
+    Serial.print(" | Angle: ");
+    Serial.print(armAngle);
+    Serial.print(" | TargetAngle: ");
+    Serial.print(targetAngleDeg);
     Serial.print(" | Motor1 PWM: ");
     Serial.print(motor1PWM);
     Serial.print(" | Mode1: ");
     Serial.print(manualMode1 ? "MAN" : "AUTO");
-    Serial.print(" | Angle: ");
-    Serial.print(boomAngle);
     Serial.print(" | Potval1: ");
     Serial.print(analogRead(pot1Pin));
     Serial.print(" | Potval2: ");
-    Serial.print(analogRead(pot2Pin));
-    Serial.print(" | Mode2: ");
-    Serial.print(manualMode2 ? "MAN" : "AUTO");
-    Serial.print(" | Moto2 PWM: ");
-    Serial.println(motor2PWM);
+    Serial.println(analogRead(pot2Pin));
 
     lastCalcTime = millis();
   }
@@ -364,19 +439,45 @@ void loop() {
   // ---- LCD update, every 250ms so its readable, not flickering ----
   if (millis() - lastLcdUpdate > 250) {
     char line[21];
-    if (millis() < diameterDisplayUntil) {
-      lcdPrintLine(0, "Spool diameter");
-      snprintf(line, sizeof(line), "%.0fmm", spoolDiameterMM);
-      lcdPrintLine(1, line);
+    if (millis() < adjustDisplayUntil) {
+      if (adjustTarget == 0) {
+        lcdPrintLine(0, "Spool diameter");
+        snprintf(line, sizeof(line), "%.0fmm", spoolDiameterMM);
+        lcdPrintLine(1, line);
+      } else {
+        lcdPrintLine(0, "Motor1 target angle");
+        snprintf(line, sizeof(line), "%.1fdeg", targetAngleDeg);
+        lcdPrintLine(1, line);
+      }
       lcdPrintLine(2, "");
       lcdPrintLine(3, "");
     } else {
-      snprintf(line, sizeof(line), "Speed:%.1fm/min", currentLinearSpeed);
-      lcdPrintLine(0, line);
-      lcdPrintLine(1, manualMode1 ? "Mode1: MANUAL" : "Mode1: AUTO");
-      snprintf(line, sizeof(line), "Angle:%.1fdeg", boomAngle);
+      char setpoint[11];
+      // setpoints only mean anything in auto mode -- in manual mode the pot drives PWM
+      // directly, there's no setpoint to show, so the line is just the live reading
+      snprintf(line, sizeof(line), "Speed %.1fm/min", currentLinearSpeed);
+      if (manualMode2) {
+        // no setpoint in manual mode -- pot2 drives PWM directly, nothing to show at right
+        lcdPrintLine(0, line);
+      } else {
+        snprintf(setpoint, sizeof(setpoint), "SP %.1f", targetSpeedMPM);
+        lcdPrintLineRJ(0, line, setpoint);
+      }
+
+      snprintf(line, sizeof(line), "Angle %.1fdeg", armAngle);
+      if (manualMode1) {
+        // no setpoint in manual mode -- pot1 drives PWM directly, nothing to show at right
+        lcdPrintLine(1, line);
+      } else {
+        snprintf(setpoint, sizeof(setpoint), "SP %.1f", targetAngleDeg);
+        lcdPrintLineRJ(1, line, setpoint);
+      }
+
+      // both motors' mode fit on one line -- MAN/AUTO abbreviated to keep the pair short
+      snprintf(line, sizeof(line), "M1:%-4s M2:%-4s", manualMode1 ? "MAN" : "AUTO",
+               manualMode2 ? "MAN" : "AUTO");
       lcdPrintLine(2, line);
-      lcdPrintLine(3, manualMode2 ? "Mode2: MANUAL" : "Mode2: AUTO");
+      lcdPrintLine(3, "");
     }
 
     lastLcdUpdate = millis();
