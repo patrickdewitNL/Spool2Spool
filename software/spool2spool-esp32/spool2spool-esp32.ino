@@ -455,26 +455,26 @@ void loop() {
       char setpoint[11];
       // setpoints only mean anything in auto mode -- in manual mode the pot drives PWM
       // directly, there's no setpoint to show, so the line is just the live reading
-      snprintf(line, sizeof(line), "Speed %.1fm/min", currentLinearSpeed);
+      snprintf(line, sizeof(line), "Spd %.1fm/min", currentLinearSpeed);
       if (manualMode2) {
         // no setpoint in manual mode -- pot2 drives PWM directly, nothing to show at right
         lcdPrintLine(0, line);
       } else {
-        snprintf(setpoint, sizeof(setpoint), "SP %.1f", targetSpeedMPM);
+        snprintf(setpoint, sizeof(setpoint), "SP %-4.1f", targetSpeedMPM);
         lcdPrintLineRJ(0, line, setpoint);
       }
 
-      snprintf(line, sizeof(line), "Angle %.1fdeg", armAngle);
+      snprintf(line, sizeof(line), "Ang %.1fdeg", armAngle);
       if (manualMode1) {
         // no setpoint in manual mode -- pot1 drives PWM directly, nothing to show at right
         lcdPrintLine(1, line);
       } else {
-        snprintf(setpoint, sizeof(setpoint), "SP %.1f", targetAngleDeg);
+        snprintf(setpoint, sizeof(setpoint), "SP %-4.1f", targetAngleDeg);
         lcdPrintLineRJ(1, line, setpoint);
       }
 
       // both motors' mode fit on one line -- MAN/AUTO abbreviated to keep the pair short
-      snprintf(line, sizeof(line), "M1:%-4s M2:%-4s", manualMode1 ? "MAN" : "AUTO",
+      snprintf(line, sizeof(line), "M1:%-4s      M2:%-4s", manualMode1 ? "MAN" : "AUTO",
                manualMode2 ? "MAN" : "AUTO");
       lcdPrintLine(2, line);
       lcdPrintLine(3, "");

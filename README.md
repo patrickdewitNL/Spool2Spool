@@ -28,14 +28,13 @@ Wemos D1 mini node reading the arm angle right at the pivot.
   (once started) cycles which value UP/DOWN adjusts: spool diameter, then motor 1's target
   angle — a transient screen shows the selected value and its new setting each time it
   changes. Motor 2's target speed isn't in this cycle; pot 2 sets that continuously instead
-  (see above). The 20x4 I2C LCD otherwise shows an "EMI Twente" splash
-  screen at boot, a "press SELECT to start" prompt, then live speed/mode2 on the top two
+  (see above). The 20x4 I2C LCD otherwise shows a "press SELECT to start" prompt, then live speed/mode2 on the top two
   lines and angle/mode1 on the bottom two.
 
 ## Hardware
 
 - ESP-WROOM-32 devkit (30-pin), 3.3V logic throughout
-- 20x4 I2C LCD (PCF8574-based backpack, address 0x27 or 0x3F depending on the module)
+- 20x4 I2C LCD (PCF8574-based backpack, address 0x27)
 - 5 discrete pushbuttons (LEFT/RIGHT/UP/DOWN/SELECT), each to GND, using the ESP32's internal
   pull-ups — no external resistors, no resistor-ladder shield
 - 2x 24V geared DC motors, each driven through a BTS7960/IBT-2 module (PWM speed control only,
@@ -49,26 +48,26 @@ Wemos D1 mini node reading the arm angle right at the pivot.
 
 ## Pin mapping
 
-| ESP32 pin | Function |
-|-----------|----------|
-| GPIO21 | I2C SDA — LCD |
-| GPIO22 | I2C SCL — LCD |
-| GPIO16 | Serial2 RX — angle data in, from the Wemos D1 mini's TX |
-| GPIO17 | Serial2 TX — unused (the link is one-way, Wemos never listens) |
-| GPIO25 | Motor 1 PWM output (no encoder — tracks motor 2's PWM + arm-angle trim) |
-| GPIO26 | Motor 2 PWM output (closed loop, driven by the encoder below) |
-| GPIO4  | Hall sensor / encoder pulse input (interrupt) — measures motor 2's shaft |
-| GPIO34 | Motor 1 manual override potentiometer (ADC1-only pin) |
-| GPIO35 | Motor 2 potentiometer — manual override PWM, or target speed setpoint in auto mode (ADC1-only pin) |
-| GPIO13 | Button: LEFT |
-| GPIO27 | Button: RIGHT |
-| GPIO32 | Button: UP |
-| GPIO33 | Button: DOWN |
-| GPIO14 | Button: SELECT |
+| ESP32 pin | Function | Cable color in cabinet|
+|-----------|----------|-------------|
+| GPIO21 | I2C SDA — LCD | yellow |
+| GPIO22 | I2C SCL — LCD | green  |
+| GPIO16 | Serial2 RX — angle data in, from the Wemos D1 mini's TX | brown |
+| GPIO17 | Serial2 TX — connected to Wemos, not used |  |
+| GPIO25 | Motor 1 PWM output (no encoder — tracks motor 2's PWM + arm-angle trim) |  |
+| GPIO26 | Motor 2 PWM output (closed loop, driven by the encoder below) |  |
+| GPIO4  | Hall sensor / encoder pulse input (interrupt) — measures motor 2's shaft |  |
+| GPIO34 | Motor 1 manual override potentiometer (ADC1-only pin) |  |
+| GPIO35 | Motor 2 potentiometer — manual override PWM, or target speed setpoint in auto mode (ADC1-only pin) |  |
+| GPIO13 | Button: LEFT |  |
+| GPIO27 | Button: RIGHT |  |
+| GPIO32 | Button: UP |  |
+| GPIO33 | Button: DOWN |  |
+| GPIO14 | Button: SELECT |  |
 
-Potentiometers are on ADC1-only pins deliberately — ADC2 conflicts with Wi-Fi on the ESP32, so
-manual-override reads stay reliable even if Wi-Fi is ever enabled. Any interrupt-capable GPIO
-works for the encoder; GPIO4 is just what's wired today.
+Red is always + 3.3V, Black is always GND. Blue is used for 5V from the ESP
+
+
 
 ## Wemos D1 mini angle-sensor node
 
@@ -79,23 +78,20 @@ the last one sent. Purely one-way (Wemos -> ESP32), 9600 baud — nothing is req
 back, and the ESP32 side (`software/spool2spool-esp32`) just listens on Serial2 (GPIO16) and
 keeps the last value it received.
 
-| Wemos pin | Function |
-|-----------|----------|
-| D1 (GPIO5) | AS5600 SCL |
-| D2 (GPIO4) | AS5600 SDA |
-| TX | Data out, to the ESP32's GPIO16 (Serial2 RX) |
-| 5V | Power in, from the ESP32 devkit's 5V/VIN pin |
-| 3V3 | Powers the AS5600 — not the incoming 5V, keeps the sensor on the same 3.3V rail as the I2C logic |
-| GND | Common ground, shared with the ESP32 and the cable shield |
+| Wemos pin | Function | Cable color |
+|-----------|----------|-------------|
+| D1 (GPIO5) | AS5600 SCL |  |
+| D2 (GPIO4) | AS5600 SDA |  |
+| TX | Data out, to the ESP32's GPIO16 (Serial2 RX) |  |
+| 5V | Power in, from the ESP32 devkit's 5V/VIN pin |  |
+| 3V3 | Powers the AS5600 — not the incoming 5V, keeps the sensor on the same 3.3V rail as the I2C logic |  |
+| GND | Common ground, shared with the ESP32 and the cable shield |  |
 
 The AS5600's DIR pin ties to GND (or VCC — either works, just don't leave it floating); GPO is
 unused since only I2C is needed here.
 
 Cable: simple 4-conductor wire for the ~1.5m run to the arm — one conductor for data, one for
-power, two for GND (data GND and power GND, or just double up one GND conductor for lower
-resistance). No twisted pair or shielding in use — not needed here, since a slow (9600 baud),
-one-way UART link tolerates a plain cable run far better than I2C ever did over this distance,
-which is why the angle sensor moved off I2C entirely in this architecture.
+power, one for GND, 1x TX one time RX.
 
 ## Libraries
 
@@ -162,10 +158,5 @@ Firmware:
 - [ ] Real compile verification of `spool2spool-esp32.ino` via arduino-cli is still outstanding —
       blocked so far by a network policy restriction, not yet re-attempted
 
-Hardware:
 
-- [ ] Design a housing for the angle sensor (AS5600 + Wemos D1 mini together)
-- [ ] Design a holder for the pulse counter (hall sensor)
-- [ ] Design the overall case (ESP-WROOM-32 + I2C LCD + 5 buttons)
-- [ ] Pick up a piece of DIN rail (or two) — 2026-09-15
-- [ ] Verify the BTS7960 modules' logic inputs accept 3.3V from the ESP32 directly
+
