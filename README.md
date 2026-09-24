@@ -24,11 +24,15 @@ Wemos D1 mini node reading the arm angle right at the pivot.
 - Both motors support **manual override**, driving speed directly from a potentiometer instead
   of the automatic logic.
 - Both motor outputs stay at **zero on power-up** until SELECT is pressed once.
-- Local UI: LEFT/RIGHT toggle manual/auto mode per motor. SELECT starts the system, then
-  (once started) cycles which value UP/DOWN adjusts: spool diameter, then motor 1's target
-  angle — a transient screen shows the selected value and its new setting each time it
-  changes. Motor 2's target speed isn't in this cycle; pot 2 sets that continuously instead
-  (see above). The 20x4 I2C LCD otherwise shows a "press SELECT to start" prompt, then live speed/mode2 on the top two
+- Local UI: LEFT/RIGHT toggle manual/auto mode per motor. A short SELECT press starts the
+  system, then (once started) cycles which value UP/DOWN adjusts: spool diameter, then motor
+  1's target angle — a transient screen shows the selected value and its new setting each time
+  it changes. Motor 2's target speed isn't in this cycle; pot 2 sets that continuously instead
+  (see above). Holding SELECT for ~1s while running **stops both motors** and re-arms the start
+  interlock (release and press again to restart) — a software convenience stop, not a
+  substitute for a real hardware emergency stop, see
+  [Machine Directive / CE compliance](#machine-directive--ce-compliance) below. The 20x4 I2C
+  LCD otherwise shows a "press SELECT to start" prompt, then live speed/mode2 on the top two
   lines and angle/mode1 on the bottom two.
 
 ## Hardware
@@ -45,6 +49,24 @@ Wemos D1 mini node reading the arm angle right at the pivot.
   override in manual mode, and its target speed setpoint in auto mode
 - A separate **Wemos D1 mini + AS5600** node mounted at the arm pivot, sending the angle over
   a serial link (see below) — no angle sensor lives on the ESP32 board itself
+
+### EMI
+
+This setup has visible susceptibility to electrical noise, most likely from the BTS7960
+drivers' PWM switching and/or from switching on the 230V/24V supply itself:
+
+- Plugging in the 230V/24V supply while the LCD is on has been observed to garble it. The
+  firmware now periodically re-inits the LCD controller (`lcdReinitIntervalMs`, every 30s) as
+  self-recovery, since a glitch on SDA/SCL can corrupt the PCF8574 backpack's internal state in
+  a way plain `lcd.print()` calls don't fix.
+- The hall sensor/encoder has shown phantom pulses (read as an implausibly high speed, which
+  then yanks motor 2's PWM down hard) — mitigated firmware-side with a debounce
+  (`minPulseIntervalMicros`) that drops edges arriving faster than any real pulse could.
+- Neither of these firmware mitigations addresses the noise at its source. If it persists,
+  hardware measures worth trying: a small RC low-pass filter right at the hall sensor output,
+  twisted-pair/shielded wiring for the sensor and I2C runs routed away from the motor power
+  leads, decoupling capacitors across the LCD backpack's and BTS7960 modules' supply pins, and
+  a proper single-point (star) ground / PE bond for the enclosure.
 
 ## Machine Directive / CE compliance
 
@@ -143,15 +165,46 @@ power, one for GND, 1x TX one time RX.
   a `begin(cols, rows)` variant, e.g. the DFRobot/Marco Schwartz-style fork most Library
   Manager searches return (the WARNING about it claiming "all architectures" is expected and
   harmless on ESP32)
+- `WiFi.h`, `WebServer.h` — built in (ESP32 core); back the WiFi dashboard/OTA feature below
+- `ElegantOTA` by Ayush Sharma — install via the Arduino Library Manager ("ElegantOTA"); serves
+  the browser-based firmware-update page
 - `AS5600` by Rob Tillaart — install via the Arduino Library Manager, needed only for the
   **Wemos** sketch, not the ESP32 sketch
+
+## WiFi dashboard & OTA firmware updates
+
+Once the board runs off an external 5V supply instead of USB (see the header comment in
+`spool2spool-esp32.ino` for the full rationale), the only way back in is over WiFi:
+
+- **Before flashing**, fill in `wifiSsid`/`wifiPassword` near the top of
+  `spool2spool-esp32.ino`. Connecting is best-effort and bounded (10s) — a missing or slow
+  network never blocks motor control.
+- **Dashboard**: `http://<device-ip>/` mirrors the LCD (live speed/angle, their setpoints,
+  motor 1/2 drive % and mode) plus a live graph of speed/angle vs. their setpoints. Graph
+  history lives in the *browser's* `localStorage`, not on the ESP32 — it only covers however
+  long that tab has been open/polling, isn't shared between browsers/devices, and has a
+  "Clear graph history" button to purge it. The graph pulls in Chart.js from a CDN, so the
+  *browser* needs internet access to render it (the ESP32 itself only needs the local network).
+- **Firmware updates**: `http://<device-ip>/update` (ElegantOTA), also linked as a button from
+  the dashboard. Because this is a browser-based updater rather than `ArduinoOTA`, the Arduino
+  IDE's own Upload button won't find it as a network port — instead use **Sketch → Export
+  Compiled Binary** (compiles without trying to upload anywhere) to produce a `.bin` in the
+  sketch folder, then upload that file through the `/update` page.
+- **AP fallback**: if the configured network isn't reachable at boot, the ESP32 hosts its own
+  access point instead (`Spool2Spool-Setup` / `spool2spool` — change the password in the
+  sketch), so the dashboard/OTA page is still reachable at `http://192.168.4.1` even out in the
+  field with no WiFi around. This only happens once, at boot — it stays on the fallback AP
+  until rebooted, it doesn't keep retrying the configured network in the background.
 
 ## Building / flashing
 
 **ESP32 main controller**: open
 [`software/spool2spool-esp32/spool2spool-esp32.ino`](software/spool2spool-esp32/spool2spool-esp32.ino)
 in the Arduino IDE, select an ESP32 Dev Module board (arduino-esp32 core 3.x — needed for
-`analogWrite()` support), install `LiquidCrystal_I2C`, and upload.
+`analogWrite()` support), install `LiquidCrystal_I2C` and `ElegantOTA`, fill in
+`wifiSsid`/`wifiPassword` (see [WiFi dashboard & OTA firmware updates](#wifi-dashboard--ota-firmware-updates)
+above), and upload over USB. After this first flash, further updates can go out over OTA
+instead — USB is only required once.
 
 **Wemos angle-sensor node**: open
 [`software/WemosAngleSensor/WemosAngleSensor.ino`](software/WemosAngleSensor/WemosAngleSensor.ino),
@@ -163,9 +216,24 @@ A handful of constants at the top of `spool2spool-esp32.ino` are meant to be tun
 
 - `targetSpeedMPM` — motor 2's target speed in m/min, set continuously from pot 2 while in
   auto mode (see "What it does" above); the value at declaration is just a fallback default
-- `Kp` — motor 2's proportional gain (speed loop); raised from an initial 0.5 (too slow, took
-  ~20s to close a full-range error) to 3.0 — still just a starting guess, keep tuning on the
-  bench, some overshoot is acceptable
+- `Kp` — motor 2's speed-loop gain, currently 4.0. Named `Kp` but functionally an *integral*
+  gain: the loop accumulates `Kp * error / 10` into the PWM every cycle rather than setting the
+  PWM fresh from the current error each time, so it drives steady-state error to zero given
+  enough cycles, at the cost of a slower initial response than true proportional control would
+  give — still just a starting guess, keep tuning on the bench
+- `maxMotor2PwmStepPerCycle` — caps how much the integral term above can move motor 2's PWM in
+  a single ~1s cycle, in either direction. Without this, a big fresh error (e.g. at startup:
+  target speed vs. actual 0) integrates into a near-instant slam to a high PWM before the
+  motor/spool can physically respond — this smooths that into a gradual ramp instead. Doesn't
+  affect the SELECT long-press stop or a real emergency stop, both of which cut power directly
+  rather than ramping down through this loop
+- `maxSetpointRampMPMPerCycle` — separate from the PWM-side cap above: slews the *setpoint*
+  actually fed into the control loop's error calculation up to `targetSpeedMPM` instead of
+  jumping straight to it, reset to 0 on every start. Targets startup overshoot specifically —
+  even with the PWM step capped, a large fresh error (target vs. actual 0 at startup) stays
+  large for several cycles while the motor/feedback catch up, so the integral term keeps adding
+  the max step the whole time and has to unwind it afterward. Ramping the setpoint means the
+  loop is never handed a big error to wind up against in the first place
 - `spoolDiameterMM` — used to convert `targetSpeedMPM` to a target RPM for motor 2, and for
   the m/min display; live-adjustable via UP/DOWN, does not persist across power cycles
 - `targetAngleDeg` — motor 1's target arm angle, live-adjustable via UP/DOWN; starting value
@@ -185,7 +253,12 @@ move before a new reading is sent.
 
 Firmware:
 
-- [ ] Tune `Kp` (motor 2 speed loop) against the real motor/load once motor 2 is running
+- [x] Tune `Kp` (motor 2 speed loop) against the real motor/load once motor 2 is running --
+      confirmed working on the bench. Along the way this also surfaced and fixed several real
+      bugs beyond tuning: hall-sensor debounce/plausibility filtering (`minPulseIntervalMicros`,
+      `maxPlausibleRpmJumpFactor`), integer-truncation steady-state offset (`motor2PWMF`), pot
+      setpoint noise (`pot2Filtered`), and startup overshoot (`maxMotor2PwmStepPerCycle`,
+      `maxSetpointRampMPMPerCycle`) -- see [Configuration](#configuration) for all of these
 - [ ] Tune `KpAngle` and `angleTrimLimitPWM` (motor 1's angle trim) on the bench
 - [ ] Set `angleMin`/`angleMax` from the arm's actual range of motion, and pick a sensible
       starting `targetAngleDeg` within that range
@@ -208,4 +281,6 @@ Hardware / compliance:
       firmware reads — see [Machine Directive / CE compliance](#machine-directive--ce-compliance)
 - [ ] Document a risk assessment (EN ISO 12100) covering the arm/spool pinch points before this
       leaves the bench
+- [ ] Track down the EMI source (see the [EMI](#emi) note above) with hardware measures --
+      firmware-side debounce/re-init are mitigations, not a fix
 

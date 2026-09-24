@@ -21,12 +21,18 @@ const char dashboardHtml[] PROGMEM = R"rawliteral(
 <title>Spool2Spool</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
-  body { font-family: sans-serif; background:#111; color:#eee; margin:0; padding:16px; }
+  body { font-family: sans-serif; background:#fff; color:#222; margin:0; padding:16px; }
   h1 { font-size:1.2em; margin:0 0 12px; }
   table { border-collapse:collapse; margin-bottom:16px; }
   td { padding:4px 12px 4px 0; }
   .val { font-weight:bold; }
-  a { color:#6cf; }
+  .btn {
+    display:inline-block; padding:8px 16px; background:#0a6cff; color:#fff;
+    text-decoration:none; border-radius:4px; font-weight:bold;
+  }
+  .btn:hover { background:#0857cc; }
+  .btn.secondary { background:#888; }
+  .btn.secondary:hover { background:#666; }
 </style>
 </head>
 <body>
@@ -37,7 +43,10 @@ const char dashboardHtml[] PROGMEM = R"rawliteral(
   <tr><td>M1</td><td class="val" id="m1">--</td><td>M2</td><td class="val" id="m2">--</td></tr>
 </table>
 <canvas id="chart" height="120"></canvas>
-<p><a href="/update">Firmware update (OTA)</a></p>
+<p>
+  <a class="btn" href="/update">Firmware update (OTA)</a>
+  <button class="btn secondary" id="purgeBtn" type="button">Clear graph history</button>
+</p>
 <script>
 const HISTORY_KEY = 's2sHistory';
 const MAX_POINTS = 1800; // ~30min at 1 sample/sec, capped so localStorage doesn't grow unbounded
@@ -54,8 +63,10 @@ const chart = new Chart(ctx, {
   data: {
     labels: history.map(p => new Date(p.t).toLocaleTimeString()),
     datasets: [
-      { label: 'Speed (m/min)', data: history.map(p => p.speed), borderColor: '#6cf', pointRadius: 0, tension: 0.2 },
-      { label: 'Angle (deg)', data: history.map(p => p.angle), borderColor: '#fc6', pointRadius: 0, tension: 0.2, yAxisID: 'y1' }
+      { label: 'Speed (m/min)', data: history.map(p => p.speed), borderColor: '#0a6cff', borderWidth: 1.5, pointRadius: 0, tension: 0.2 },
+      { label: 'Speed setpoint', data: history.map(p => p.targetSpeed), borderColor: '#0a6cff', borderWidth: 1.5, borderDash: [4, 3], pointRadius: 0, tension: 0.2 },
+      { label: 'Angle (deg)', data: history.map(p => p.angle), borderColor: '#e08a00', borderWidth: 1.5, pointRadius: 0, tension: 0.2, yAxisID: 'y1' },
+      { label: 'Angle setpoint', data: history.map(p => p.targetAngle), borderColor: '#e08a00', borderWidth: 1.5, borderDash: [4, 3], pointRadius: 0, tension: 0.2, yAxisID: 'y1' }
     ]
   },
   options: {
@@ -76,16 +87,29 @@ function poll() {
     document.getElementById('m1').textContent = d.mode1 + ' ' + d.m1Percent + '%';
     document.getElementById('m2').textContent = d.mode2 + ' ' + d.m2Percent + '%';
 
-    history.push({ t: Date.now(), speed: d.speed, angle: d.angle });
+    history.push({ t: Date.now(), speed: d.speed, targetSpeed: d.targetSpeed, angle: d.angle, targetAngle: d.targetAngle });
     if (history.length > MAX_POINTS) history.shift();
     try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch (e) {}
 
-    chart.data.labels = history.map(p => new Date(p.t).toLocaleTimeString());
-    chart.data.datasets[0].data = history.map(p => p.speed);
-    chart.data.datasets[1].data = history.map(p => p.angle);
-    chart.update('none');
+    updateChartData();
   }).catch(() => {});
 }
+
+function updateChartData() {
+  chart.data.labels = history.map(p => new Date(p.t).toLocaleTimeString());
+  chart.data.datasets[0].data = history.map(p => p.speed);
+  chart.data.datasets[1].data = history.map(p => p.targetSpeed);
+  chart.data.datasets[2].data = history.map(p => p.angle);
+  chart.data.datasets[3].data = history.map(p => p.targetAngle);
+  chart.update('none');
+}
+
+document.getElementById('purgeBtn').addEventListener('click', () => {
+  history = [];
+  try { localStorage.removeItem(HISTORY_KEY); } catch (e) {}
+  updateChartData();
+});
+
 setInterval(poll, 1000);
 poll();
 </script>

@@ -19,8 +19,12 @@
     noisy/unreliable right at startup, so a bad first reading can only nudge motor 1 a
     little, never throw it far from motor 2's PWM.
   - Buttons: LEFT/RIGHT toggle manual/auto mode per motor. SELECT starts the system, then
-    (once started) cycles what UP/DOWN adjusts: spool diameter, then motor 1's target angle.
-  - Both motor outputs stay at zero after power up until SELECT is pressed once
+    (once started) a short press cycles what UP/DOWN adjusts: spool diameter, then motor 1's
+    target angle. Holding SELECT for ~1s while running stops both motors and re-arms the start
+    interlock (a software convenience stop, not a substitute for a real hardware emergency
+    stop -- see the README's "Machine Directive / CE compliance" section).
+  - Both motor outputs stay at zero after power up until SELECT is pressed once, and again
+    after a SELECT long-press stop until it's pressed again
   - LCD shows an "EMI Twente" splash screen at boot, then a "press SELECT to start" prompt,
     then live speed/angle/mode
 
@@ -106,26 +110,84 @@ const int motor2PwmPin = 26;  // motor 2, closed loop RPM control (this motor ha
 // ---- Encoder / hall pulse pin (motor 2 speed feedback -- the only encoder in this system) ----
 const int encoderPin = 4;     // interrupt capable — any GPIO works on ESP32
 volatile unsigned long pulseCount = 0;          // lifetime count, diagnostics only
-volatile unsigned long lastPulseMicros = 0;     // micros() at the most recent pulse
-volatile unsigned long pulsePeriodMicros = 0;   // time between the last two pulses
+volatile unsigned long lastPulseMicros = 0;     // micros() at the most recent *accepted* pulse
+volatile unsigned long pulsePeriodMicros = 0;   // time between the last two accepted pulses
 // no pulse for this long -> treat as stopped rather than let the RPM estimate decay forever
 const unsigned long stalledTimeoutMicros = 10000000UL;  // 10s, ~2x the slowest expected pulse interval
+// debounces the hall sensor -- an open-collector output sitting right next to a PWM motor
+// driver is prone to noise glitches (mechanical contact bounce, or the driver's switching
+// coupling into the sensor wire), each of which reads as an extra FALLING edge and spikes the
+// computed RPM way past reality, which then yanks the speed loop's PWM down hard for a step
+// (see loop() below) -- looks like "speed fluctuates and the motor randomly stops". A genuine
+// pulse can't arrive faster than ~94ms even in the fastest realistic case (10 m/min on the
+// smallest 5mm spool, 1 pulse/rev -> ~637 RPM); anything closer together than this is treated
+// as noise and dropped, not counted as a real pulse.
+const unsigned long minPulseIntervalMicros = 10000UL;  // 10ms -- well under the ~94ms fastest
+                                                         // realistic pulse, well above typical
+                                                         // bounce/EMI glitch duration
 unsigned long lastCalcTime = 0;
 float currentRPM = 0;
 float currentLinearSpeed = 0;  // m/min, derived from the smoothed RPM and spoolDiameterMM, for display only
 
+// ---- RPM plausibility filter -- catches noise the debounce above can't. minPulseIntervalMicros
+// only rejects edges arriving implausibly fast (sub-10ms bounce); it does nothing about a noise
+// pulse landing tens or hundreds of ms after a real one, well above that floor but still far
+// too soon for a genuine revolution at the current speed (seen on the bench: RPM jumping
+// ~51 -> 189 -> ~48 in consecutive 1s samples, which this motor/spool cannot physically do --
+// a real reading can't be several times the recent trend in a single update). Readings more
+// than maxPlausibleRpmJumpFactor times the last *accepted* RPM are treated as noise and
+// discarded (reusing the last accepted value for that cycle) instead of feeding the averages
+// or the control loop.
+//
+// Only ever holds a reading back for maxConsecutiveRejections cycles, not indefinitely: if
+// lastAcceptedRPM simply never updated again once a reading was rejected, a *genuine* fast
+// change (ramp-up from a stop, a setpoint jump) would permanently freeze it at a stale low
+// value -- and since the control loop below compares the target against that frozen number,
+// it keeps reading a huge error and cranks motor2PWM toward max forever trying to close a gap
+// that can never close, while the real (unreported) speed runs away. Seen on the bench. A
+// second consecutive implausible reading is far more likely to be a genuine change than two
+// coincidental noise spikes in a row, so it's accepted outright rather than held again.
+float lastAcceptedRPM = 0;
+int consecutiveRejectedRPM = 0;
+const float maxPlausibleRpmJumpFactor = 1.5;  // tune down if real glitches still get through,
+                                                // up if genuine fast accelerations start
+                                                // getting held back
+const int maxConsecutiveRejections = 1;        // hold back this many implausible readings in a
+                                                 // row before giving up and accepting the latest
+
 // ---- Speed display smoothing ----
-// currentRPM (used by the P-controller below) stays raw/unfiltered on purpose, so this only
-// smooths what's shown on the LCD/serial, it doesn't change motor control response.
+// display only (LCD/dashboard/serial) -- deliberately heavier than the control-loop smoothing
+// below, since a slow-moving display reading is fine but a slow-reacting P-loop isn't.
 const int speedAvgSamples = 5;  // ~5 seconds of smoothing at the once-per-second update rate
 float speedAvgBuffer[speedAvgSamples] = {0};
 int speedAvgIndex = 0;
 int speedAvgCount = 0;  // samples recorded so far, caps at speedAvgSamples
 
+// ---- Speed control-loop smoothing ----
+// a single one-pulse-per-rev period reading is inherently noisy (cogging, gear backlash,
+// pulse-timing quantization) even with the hall sensor's debounce above catching genuinely
+// spurious pulses -- feeding that raw noise straight into the *additive* P-loop below
+// (motor2PWM += ...) every second was pushing the motor around on every noisy reading. This
+// is a separate, lighter average than the display's (controlAvgSamples vs. speedAvgSamples):
+// short enough that the loop still reacts to a real speed change (setpoint turn, load change)
+// within a couple of seconds, not the display's ~5s.
+const int controlAvgSamples = 3;
+float controlAvgBuffer[controlAvgSamples] = {0};
+int controlAvgIndex = 0;
+int controlAvgCount = 0;
+
 // ---- Potentiometers ----
 const int pot1Pin = 34;  // motor 1 manual speed (ADC1-only pin)
 const int pot2Pin = 35;  // motor 2: manual PWM in manual mode, target speed setpoint in
                           // auto mode -- same knob, different meaning (ADC1-only pin)
+
+// ---- Pot 2 smoothing -- the ESP32 ADC has a few LSBs of read noise on its own, which
+// otherwise jitters targetSpeedMPM (and the PWM it maps to in manual mode) on every loop()
+// pass even with the pot held dead still. Exponential moving average, updated every loop --
+// potEmaAlpha trades responsiveness for smoothness: lower = smoother but slower to follow a
+// real knob turn.
+float pot2Filtered = -1;  // -1 = not seeded yet, see loop()
+const float potEmaAlpha = 0.05;
 
 // ---- Buttons (discrete GPIOs, internal pull-up, pressed = LOW) ----
 const int btnLeftPin   = 13;
@@ -136,6 +198,17 @@ const int btnSelectPin = 14;
 
 // ---- Start interlock, both motor outputs stay at zero until SELECT is pressed once ----
 bool started = false;
+
+// ---- SELECT long-press: stops both motors and re-arms the start interlock above, while
+// running. Not a dedicated button since all 5 GPIOs are already spoken for (SELECT itself
+// short-press cycles the UP/DOWN adjust target while running -- see loop()). This is a
+// software convenience stop, not a substitute for a real hardware emergency stop -- see the
+// README's "Machine Directive / CE compliance" section. ----
+unsigned long selectPressedSinceMillis = 0;    // 0 = not currently held
+bool selectStopFired = false;                  // guards against re-firing every loop while held
+bool waitForSelectRelease = false;             // after a long-press stop, SELECT must be
+                                                // released once before it's armed to start again
+const unsigned long selectStopHoldMs = 1000;   // hold SELECT this long (while running) to stop
 
 // ---- Mode state, true = manual, false = automatic ----
 bool manualMode1 = false;
@@ -148,11 +221,39 @@ const float speedMinMPM = 0.0;
 const float speedMaxMPM = 10.0;
 int motor2PWM = 0;                      // starting point, self adjusts -- overwritten in setup()
                                          // from pot2's actual reading, not a hardcoded guess
+// float shadow of motor2PWM -- the P-loop accumulates its correction into this, not directly
+// into the int above. (int)(Kp * error / 10) truncates toward zero, so with Kp=4.0 any RPM
+// error under 2.5 truncates to a 0 correction and gets silently discarded every cycle,
+// forever -- seen on the bench as a small, permanent steady-state offset (e.g. 0.1 m/min low)
+// where the PWM never budges again. Keeping the accumulator as a float lets those sub-1
+// corrections build up across cycles instead of being thrown away each time; motor2PWM (the
+// int actually written to the pin) is only ever rounded from this.
+float motor2PWMF = 0;
 const float Kp = 4.0;                   // raised from 0.5 -- that crawled toward setpoint over
                                          // ~20s for a full-range error; some overshoot is fine,
                                          // keep raising if still slow, lower if it starts hunting
+// caps how far motor2PWMF can move in a single control-loop cycle (currently 1s), regardless
+// of what the integral term above computes -- without this, a big fresh error (e.g. at
+// startup: target speed vs. actual 0, or a large setpoint jump) integrates into a near-instant
+// slam to a high PWM before the motor/spool have had any chance to physically respond and
+// produce real feedback. Applies symmetrically (also slows a fast reduction), which is safe
+// here since the SELECT long-press stop and any real emergency stop both cut power directly,
+// bypassing this loop entirely rather than ramping down through it.
+const float maxMotor2PwmStepPerCycle = 15.0;
 
-// ---- Motor 1's angle range -- adjust to match your arm's real min/max angle in degrees ----
+// ---- Setpoint ramp -- softens startup specifically, which maxMotor2PwmStepPerCycle alone
+// doesn't fully fix. At startup the error (target vs. actual 0) is large and stays large for
+// several cycles while the motor physically spools up and the feedback average catches up, so
+// the integral term keeps adding the max step every cycle for that whole stretch, then has to
+// unwind all of it afterward -- seen on the bench as a large, slow overshoot specifically when
+// starting, not during normal regulation where errors are already small. Ramping the setpoint
+// itself up to targetSpeedMPM instead of jumping straight to it means the loop is never
+// presented with a big error to begin winding up against in the first place. Reset to 0 on
+// every start (see loop()) so this applies every time, not just the very first one.
+float rampedTargetSpeedMPM = 0;
+const float maxSetpointRampMPMPerCycle = 0.1;  // m/min the ramp can move per ~1s cycle -- e.g.
+                                                 // a 4.5 m/min target takes ~45s to fully ramp
+                                                 // in at this rate; lower = softer/slower start
 const float angleMin = 0.0;
 const float angleMax = 350.0;
 
@@ -190,6 +291,18 @@ String angleLineBuffer = "";
 // ---- LCD refresh timing ----
 unsigned long lastLcdUpdate = 0;
 
+// ---- LCD periodic re-init -- self-recovery from I2C glitches (e.g. plugging in the 230V/24V
+// supply near the LCD has been observed to garble it). lcdPrintLine() rewrites the visible
+// characters every 250ms already, but an EMI glitch on SDA/SCL can corrupt the PCF8574
+// backpack's own internal state (cursor/config registers), not just what's currently on
+// screen -- normal lcd.print() calls don't touch those, only a full lcd.begin() re-sends the
+// init sequence and fixes it. This blindly re-inits on a timer since the LCD is write-only
+// from this side (no way to read back and detect actual corruption); the brief blank-then-
+// redraw flash every interval is the tradeoff for not needing a manual power cycle to clear a
+// garbled display.
+unsigned long lastLcdReinit = 0;
+const unsigned long lcdReinitIntervalMs = 30000UL;
+
 // ---- Button reading ----
 // same return codes as the original shield version (0=right,1=up,2=down,3=left,4=select,
 // -1=none), so the rest of the button-handling logic below didn't need to change at all
@@ -205,7 +318,11 @@ int lastButton = -1;
 
 void countPulse() {
   unsigned long now = micros();
-  pulsePeriodMicros = now - lastPulseMicros;
+  unsigned long sinceLastPulse = now - lastPulseMicros;
+  if (sinceLastPulse < minPulseIntervalMicros) {
+    return;  // too soon after the last accepted pulse to be real -- debounce/noise, ignore it
+  }
+  pulsePeriodMicros = sinceLastPulse;
   lastPulseMicros = now;
   pulseCount++;
 }
@@ -367,6 +484,7 @@ void setup() {
   // instead of a hardcoded guess -- same inverted mapping as manual mode uses
   motor1PWM = map(analogRead(pot1Pin), 0, 4095, 255, 0);
   motor2PWM = map(analogRead(pot2Pin), 0, 4095, 255, 0);
+  motor2PWMF = motor2PWM;
 
   lastCalcTime = millis();
 
@@ -396,6 +514,13 @@ unsigned long lastWaitingDebug = 0;
 void loop() {
   updateArmAngleFromSerial();  // non-blocking; keeps armAngle fresh whenever the Wemos sends
 
+  // ---- periodic LCD re-init -- self-recovery from I2C glitches, see lastLcdReinit above ----
+  if (millis() - lastLcdReinit > lcdReinitIntervalMs) {
+    lcd.begin(20, 4);
+    lcd.backlight();
+    lastLcdReinit = millis();
+  }
+
   // ---- dashboard/OTA request handling -- setup() always leaves the server running, on
   // either the configured network or the fallback AP, so this is unconditional. Reachable
   // even before SELECT is pressed, deliberately ahead of the !started early-return below. ----
@@ -405,9 +530,29 @@ void loop() {
   // ---- both outputs stay at zero until SELECT has been pressed once ----
   if (!started) {
     int startBtn = readLCDButton();
-    if (startBtn == 4) {  // SELECT
+    // after a long-press stop (below), SELECT is still physically held -- don't let that same
+    // press instantly restart it, wait for it to be released at least once first
+    if (waitForSelectRelease && startBtn != 4) {
+      waitForSelectRelease = false;
+    }
+    if (!waitForSelectRelease && startBtn == 4) {  // SELECT
       started = true;
       lastButton = startBtn;
+      // this press is already down right now -- start the long-press-stop timer fresh from
+      // this moment, otherwise a stale timestamp from a previous stop could re-trigger it
+      // on the very press that just started the system
+      selectPressedSinceMillis = millis();
+      selectStopFired = false;
+      rampedTargetSpeedMPM = 0;  // soft-start the setpoint fresh on every start, not just the
+                                  // very first one -- see maxSetpointRampMPMPerCycle above
+      // motor2PWMF/motor2PWM otherwise still hold setup()'s one-time seed from wherever pot 2
+      // happened to be at boot (or whatever they were at the last stop) -- that gets written
+      // to the pin instantly the moment `started` flips true, completely bypassing the ramp
+      // above, which only limits how fast the *correction* changes PWM, not this baseline.
+      // Reset both to 0 here so the very first PWM after a start is actually 0, not a jump.
+      motor2PWMF = 0;
+      motor2PWM = 0;
+      analogWrite(motor2PwmPin, 0);
       lcd.clear();
       Serial.println("SELECT pressed -- started");
     } else {
@@ -429,6 +574,29 @@ void loop() {
 
   // ---- read buttons, act on new press only ----
   int btn = readLCDButton();
+
+  // ---- SELECT held for selectStopHoldMs -- stop both motors, independent of the short-press
+  // cycle-adjust-target action below. Must return immediately: motor2/motor1 PWM further down
+  // get re-driven every loop from the pots in manual mode, so just zeroing them here and
+  // falling through would have them immediately overwritten this same iteration. ----
+  if (btn == 4) {
+    if (selectPressedSinceMillis == 0) selectPressedSinceMillis = millis();
+    if (!selectStopFired && millis() - selectPressedSinceMillis >= selectStopHoldMs) {
+      selectStopFired = true;
+      waitForSelectRelease = true;
+      started = false;
+      analogWrite(motor1PwmPin, 0);
+      analogWrite(motor2PwmPin, 0);
+      lcd.clear();
+      Serial.println("SELECT held -- both motors stopped, release SELECT to re-arm");
+      lastButton = btn;
+      return;
+    }
+  } else {
+    selectPressedSinceMillis = 0;
+    selectStopFired = false;
+  }
+
   if (btn != -1 && btn != lastButton) {
     if (btn == 3) manualMode1 = !manualMode1;  // LEFT toggles motor 1 mode
     if (btn == 0) manualMode2 = !manualMode2;  // RIGHT toggles motor 2 mode
@@ -458,9 +626,14 @@ void loop() {
   lastButton = btn;
 
   // ---- motor 2: manual pot drives PWM directly, auto pot sets the target speed instead ----
-  int potVal2 = analogRead(pot2Pin);
+  int potVal2Raw = analogRead(pot2Pin);
+  if (pot2Filtered < 0) pot2Filtered = potVal2Raw;  // seed on the very first read, no ramp-in
+  pot2Filtered += potEmaAlpha * (potVal2Raw - pot2Filtered);
+  int potVal2 = (int)(pot2Filtered + 0.5f);
   if (manualMode2) {
     motor2PWM = map(potVal2, 0, 4095, 255, 0);  // inverted: potVal 0 = full, 4095 = stop. ESP32 ADC is 12-bit (0-4095), not 10-bit like AVR
+    motor2PWMF = motor2PWM;  // keep the float accumulator in sync so switching back to auto
+                              // continues smoothly from here, not a stale pre-manual value
     analogWrite(motor2PwmPin, motor2PWM);
   } else {
     // same inverted feel as manual mode: 0 = max target speed, 4095 = stop
@@ -493,6 +666,26 @@ void loop() {
       currentRPM = 60000000.0 / effectivePeriod;  // change multiplier if more than 1 pulse per rev
     }
 
+    // plausibility filter -- see lastAcceptedRPM/maxPlausibleRpmJumpFactor above. Only guards
+    // against an implausible *increase*; a drop (including to 0, a genuine stop) always passes
+    // straight through, no jump-factor check needed on that side, and always resets the
+    // rejection streak.
+    bool implausible = lastAcceptedRPM > 1.0 && currentRPM > lastAcceptedRPM * maxPlausibleRpmJumpFactor;
+    if (implausible && consecutiveRejectedRPM < maxConsecutiveRejections) {
+      consecutiveRejectedRPM++;
+      Serial.print("Holding implausible RPM reading (");
+      Serial.print(consecutiveRejectedRPM);
+      Serial.print(" in a row): ");
+      Serial.print(currentRPM);
+      Serial.print(" (last accepted ");
+      Serial.print(lastAcceptedRPM);
+      Serial.println(")");
+      currentRPM = lastAcceptedRPM;  // reuse the last good reading this cycle instead
+    } else {
+      lastAcceptedRPM = currentRPM;
+      consecutiveRejectedRPM = 0;
+    }
+
     // moving average over the last speedAvgSamples RPM readings, smooths the displayed
     // speed so it eases toward 0 instead of snapping there the instant pulses stop
     speedAvgBuffer[speedAvgIndex] = currentRPM;
@@ -505,12 +698,30 @@ void loop() {
 
     currentLinearSpeed = avgRPM * PI * (spoolDiameterMM / 1000.0);  // m/min, smoothed
 
+    // separate, lighter average feeding the control loop below -- see controlAvgSamples above
+    controlAvgBuffer[controlAvgIndex] = currentRPM;
+    controlAvgIndex = (controlAvgIndex + 1) % controlAvgSamples;
+    if (controlAvgCount < controlAvgSamples) controlAvgCount++;
+
+    float controlRpmSum = 0;
+    for (int i = 0; i < controlAvgCount; i++) controlRpmSum += controlAvgBuffer[i];
+    float controlRPM = controlRpmSum / controlAvgCount;
+
     // ---- motor 2: closed loop, target speed converted to RPM via the spool diameter ----
     if (!manualMode2) {
-      float targetRPM = targetSpeedMPM / (PI * (spoolDiameterMM / 1000.0));
-      float error = targetRPM - currentRPM;
-      motor2PWM += (int)(Kp * error / 10);
-      motor2PWM = constrain(motor2PWM, 0, 255);
+      // slew rampedTargetSpeedMPM toward the real targetSpeedMPM instead of using it directly
+      // -- see maxSetpointRampMPMPerCycle above
+      if (rampedTargetSpeedMPM < targetSpeedMPM) {
+        rampedTargetSpeedMPM = min(rampedTargetSpeedMPM + maxSetpointRampMPMPerCycle, targetSpeedMPM);
+      } else {
+        rampedTargetSpeedMPM = max(rampedTargetSpeedMPM - maxSetpointRampMPMPerCycle, targetSpeedMPM);
+      }
+
+      float targetRPM = rampedTargetSpeedMPM / (PI * (spoolDiameterMM / 1000.0));
+      float error = targetRPM - controlRPM;
+      float step = constrain(Kp * error / 10, -maxMotor2PwmStepPerCycle, maxMotor2PwmStepPerCycle);
+      motor2PWMF = constrain(motor2PWMF + step, 0.0f, 255.0f);
+      motor2PWM = (int)(motor2PWMF + 0.5f);  // round for the actual PWM write, don't truncate
       analogWrite(motor2PwmPin, motor2PWM);
     }
 
