@@ -44,17 +44,60 @@
     a begin(cols, rows) variant, e.g. the one bundled with the DFRobot/Marco Schwartz-style
     fork most Library Manager searches return; default I2C address assumed 0x27 below,
     change if your backpack uses 0x3F, or run an I2C scanner sketch if the display stays blank)
+  - WiFi.h, WebServer.h    (built in)
+  - ElegantOTA.h           (install via Library Manager, search "ElegantOTA" by Ayush Sharma)
 
   Requires arduino-esp32 core 3.x — that's what gives analogWrite() direct PWM support here,
   same call signature as the original AVR code. Older cores need ledcWrite() instead.
+
+  WiFi / OTA / web dashboard:
+  - Once this board runs off an external 5V supply instead of USB, wifiSsid/wifiPassword below
+    must be filled in before flashing -- that's the only way to reach it afterwards.
+  - The web page at http://<device-ip>/ mirrors the LCD (speed, angle, motor %, modes) plus a
+    live graph; firmware updates happen from the browser at http://<device-ip>/update
+    (ElegantOTA), no Arduino IDE or USB needed.
+  - The graph's history lives in the browser's localStorage, not on the ESP32 -- it only
+    accumulates while that browser tab has been polling, resets if you clear site data, and
+    isn't shared between browsers/devices viewing the page.
+  - The dashboard's Chart.js is loaded from a CDN, so the *browser* needs internet access to
+    render the graph (the ESP32 itself only needs to be on the same LAN, no internet required).
+  - WiFi connection is best-effort and never blocks motor control: it times out after 10s at
+    boot if not connected -- the motors run with or without WiFi.
+  - AP fallback: if the configured network isn't reachable at boot, the device becomes its own
+    WiFi access point (apSsid/apPassword below) instead of being unreachable -- connect a phone
+    or laptop to it and the same dashboard/OTA page is at http://192.168.4.1 (ESP32's default
+    AP address). This is the way to push a firmware fix out in the field with no WiFi around.
+    It only kicks in once, at boot -- if it falls back to AP, it stays on AP until rebooted, it
+    doesn't keep trying the configured network in the background afterwards.
 */
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ElegantOTA.h>
+#include "dashboard_html.h"
 
 // ---- I2C LCD ----
 // address 0x27 is the common default for PCF8574-based backpacks; some use 0x3F instead
 LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// ---- WiFi / OTA / web dashboard ----
+// fill these in before flashing -- see header comment above for what this enables. Not
+// secret enough to warrant anything fancier than living here, this device never leaves a
+// private network.
+const char *wifiSsid = "VerkeerdVerbonden";
+const char *wifiPassword = "welkomopzuiderzee663";
+const unsigned long wifiConnectTimeoutMs = 10000;  // best-effort at boot, never blocks longer than this
+
+// AP fallback -- if wifiSsid isn't reachable at boot, the device hosts this network itself
+// instead, so the dashboard/OTA page is always reachable somehow. WPA2-protected since this
+// AP exposes the /update firmware page to whoever joins it -- change the password below.
+const char *apSsid = "Spool2Spool-Setup";
+const char *apPassword = "spool2spool";  // WPA2 needs >= 8 chars
+
+WebServer server(80);
+bool otaReady = false;  // true once server.begin()/ElegantOTA.begin() have run (STA or AP)
 
 // ---- Motor pins ----
 const int motor1PwmPin = 25;  // motor 1, no encoder -- tracks motor 2's PWM, fine-tuned by arm angle
@@ -105,7 +148,7 @@ const float speedMinMPM = 0.0;
 const float speedMaxMPM = 10.0;
 int motor2PWM = 0;                      // starting point, self adjusts -- overwritten in setup()
                                          // from pot2's actual reading, not a hardcoded guess
-const float Kp = 3.0;                   // raised from 0.5 -- that crawled toward setpoint over
+const float Kp = 4.0;                   // raised from 0.5 -- that crawled toward setpoint over
                                          // ~20s for a full-range error; some overshoot is fine,
                                          // keep raising if still slow, lower if it starts hunting
 
@@ -203,6 +246,55 @@ void updateArmAngleFromSerial() {
   }
 }
 
+void handleRoot() {
+  server.send_P(200, "text/html", dashboardHtml);
+}
+
+void handleData() {
+  char json[256];
+  int m1Percent = (motor1PWM * 100 + 127) / 255;
+  int m2Percent = (motor2PWM * 100 + 127) / 255;
+  snprintf(json, sizeof(json),
+           "{\"speed\":%.2f,\"targetSpeed\":%.2f,\"angle\":%.2f,\"targetAngle\":%.2f,"
+           "\"m1Percent\":%d,\"m2Percent\":%d,\"mode1\":\"%s\",\"mode2\":\"%s\","
+           "\"started\":%s}",
+           currentLinearSpeed, targetSpeedMPM, armAngle, targetAngleDeg, m1Percent, m2Percent,
+           manualMode1 ? "MAN" : "AUTO", manualMode2 ? "MAN" : "AUTO",
+           started ? "true" : "false");
+  server.send(200, "application/json", json);
+}
+
+// registers the dashboard/OTA routes and starts the web server -- shared by both the normal
+// (STA) and fallback (AP) paths below, since the page itself doesn't care which interface it's
+// reachable on
+void bindRoutesAndStartServer() {
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  ElegantOTA.begin(&server);
+  server.begin();
+  otaReady = true;
+}
+
+// called once WiFi connects, either at boot or from a later background retry (see loop())
+void startWebServices() {
+  Serial.print("WiFi connected, dashboard/OTA at http://");
+  Serial.println(WiFi.localIP());
+  bindRoutesAndStartServer();
+}
+
+// no configured network reachable -- become one instead, so the dashboard/OTA page (and a way
+// to push a firmware fix) is always reachable directly from a phone/laptop, even in the field
+// with no WiFi around
+void startFallbackAP() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(apSsid, apPassword);
+  Serial.print("WiFi not found -- started fallback AP \"");
+  Serial.print(apSsid);
+  Serial.print("\", dashboard/OTA at http://");
+  Serial.println(WiFi.softAPIP());
+  bindRoutesAndStartServer();
+}
+
 // scans all 7-bit I2C addresses and prints whatever ACKs — run once at boot so a wiring or
 // address problem (wrong SDA/SCL, no pull-ups, wrong backpack address) shows up on Serial
 // before we even try to talk to the LCD
@@ -257,6 +349,8 @@ void setup() {
   lcd.clear();
   lcd.setCursor(5, 0);  // (20 - 10) / 2, centers "EMI Twente" on a 20 column display
   lcd.print("EMI Twente");
+  lcd.setCursor(1, 2);  // (20 - 17) / 2, rounded down, centers "CoatyMac Coatface" on the third line
+  lcd.print("CoatyMac Coatface");
   Serial.println("Splash text sent to LCD");
   delay(2000);
   lcd.clear();
@@ -275,6 +369,25 @@ void setup() {
   motor2PWM = map(analogRead(pot2Pin), 0, 4095, 255, 0);
 
   lastCalcTime = millis();
+
+  // ---- WiFi / OTA / dashboard: best-effort, bounded wait -- a missing/slow network must
+  // never hold up motor control, so this gives up after wifiConnectTimeoutMs and falls back
+  // to hosting its own AP instead of blocking here indefinitely ----
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSsid, wifiPassword);
+  Serial.print("Connecting to WiFi");
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < wifiConnectTimeoutMs) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    startWebServices();
+  } else {
+    startFallbackAP();
+  }
+
   Serial.println("=== setup() complete, entering loop() ===");
 }
 
@@ -282,6 +395,12 @@ unsigned long lastWaitingDebug = 0;
 
 void loop() {
   updateArmAngleFromSerial();  // non-blocking; keeps armAngle fresh whenever the Wemos sends
+
+  // ---- dashboard/OTA request handling -- setup() always leaves the server running, on
+  // either the configured network or the fallback AP, so this is unconditional. Reachable
+  // even before SELECT is pressed, deliberately ahead of the !started early-return below. ----
+  server.handleClient();
+  ElegantOTA.loop();
 
   // ---- both outputs stay at zero until SELECT has been pressed once ----
   if (!started) {
@@ -477,7 +596,13 @@ void loop() {
       snprintf(line, sizeof(line), "M1:%-4s      M2:%-4s", manualMode1 ? "MAN" : "AUTO",
                manualMode2 ? "MAN" : "AUTO");
       lcdPrintLine(2, line);
-      lcdPrintLine(3, "");
+
+      // actual drive level under the mode line, scaled from raw PWM (0-255) to 0-100%
+      char pct1[5], pct2[5];
+      snprintf(pct1, sizeof(pct1), "%d%%", (motor1PWM * 100 + 127) / 255);
+      snprintf(pct2, sizeof(pct2), "%d%%", (motor2PWM * 100 + 127) / 255);
+      snprintf(line, sizeof(line), "M1:%-4s      M2:%-4s", pct1, pct2);
+      lcdPrintLine(3, line);
     }
 
     lastLcdUpdate = millis();

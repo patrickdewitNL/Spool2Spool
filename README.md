@@ -46,26 +46,69 @@ Wemos D1 mini node reading the arm angle right at the pivot.
 - A separate **Wemos D1 mini + AS5600** node mounted at the arm pivot, sending the angle over
   a serial link (see below) — no angle sensor lives on the ESP32 board itself
 
+## Machine Directive / CE compliance
+
+This has two motorized moving parts (the arm and the spools) that can pinch or entangle, which
+puts it in scope of the Machine Directive (2006/42/EC — being replaced by Machinery Regulation
+(EU) 2023/1230, applicable from January 2027) if it's ever placed on the market rather than kept
+as a one-off bench setup. It is **not** currently compliant. The main gap:
+
+- **No emergency stop.** EN ISO 13850 / EN 60204-1 §9.2.5.4 require a readily-accessible
+  emergency-stop device (red mushroom-head pushbutton, yellow background, latching/pull-to-release)
+  on any machine with a hazard like this. Critically, it must cut power to both motors **in
+  hardware** — wired in series with the 24V supply to the BTS7960 drivers (or through a safety
+  relay/contactor), not just wired into a GPIO for the firmware to react to. A software-only stop
+  (e.g. an E-stop button read like the existing LEFT/RIGHT/UP/DOWN/SELECT buttons, forcing
+  `motor1PWM`/`motor2PWM` to 0) doesn't satisfy this: it stops working the moment the ESP32 hangs,
+  crashes, is mid-OTA-update, or has a firmware bug — exactly when a hardware stop is needed most.
+- This should be a **Category 0 stop** per EN 60204-1 §9.2.2 (immediate removal of power to the
+  actuators) — simplest to implement here since these are plain DC motors with no regenerative
+  braking or controlled-deceleration requirement.
+- After an E-stop trip, the machine must **not** restart on its own when the button is released —
+  it needs a deliberate manual reset (e.g. releasing the latch, then pressing SELECT again to
+  restart, same as the existing power-up interlock already does).
+- The E-stop's own monitoring/status wiring, if any, is the one case in this project's wiring
+  where **orange** (EN 60204-1's color for circuits that stay energized with the main switch off)
+  would actually apply, rather than the blue used for the ordinary control signals in the tables
+  below.
+
+Beyond the E-stop, a full CE Declaration of Conformity would also need a documented risk
+assessment (EN ISO 12100) covering the arm/spool pinch points and the other Annex I essential
+health and safety requirements — worth doing before this leaves the bench, not just the E-stop
+wiring in isolation.
+
 ## Pin mapping
 
-| ESP32 pin | Function | Cable color in cabinet|
-|-----------|----------|-------------|
-| GPIO21 | I2C SDA — LCD | yellow |
-| GPIO22 | I2C SCL — LCD | green  |
-| GPIO16 | Serial2 RX — angle data in, from the Wemos D1 mini's TX | brown |
-| GPIO17 | Serial2 TX — connected to Wemos, not used |  |
-| GPIO25 | Motor 1 PWM output (no encoder — tracks motor 2's PWM + arm-angle trim) |  |
-| GPIO26 | Motor 2 PWM output (closed loop, driven by the encoder below) |  |
-| GPIO4  | Hall sensor / encoder pulse input (interrupt) — measures motor 2's shaft |  |
-| GPIO34 | Motor 1 manual override potentiometer (ADC1-only pin) |  |
-| GPIO35 | Motor 2 potentiometer — manual override PWM, or target speed setpoint in auto mode (ADC1-only pin) |  |
-| GPIO13 | Button: LEFT |  |
-| GPIO27 | Button: RIGHT |  |
-| GPIO32 | Button: UP |  |
-| GPIO33 | Button: DOWN |  |
-| GPIO14 | Button: SELECT |  |
+| ESP32 pin | Function | Cable color in cabinet | Suggested color (EN 60204-1) |
+|-----------|----------|-------------|-------------|
+| GPIO21 | I2C SDA — LCD | yellow | blue |
+| GPIO22 | I2C SCL — LCD | green  | blue |
+| GPIO16 | Serial2 RX — angle data in, from the Wemos D1 mini's TX | brown | blue |
+| GPIO17 | Serial2 TX — connected to Wemos, not used |  | blue |
+| GPIO25 | Motor 1 PWM output (no encoder — tracks motor 2's PWM + arm-angle trim) |  | blue |
+| GPIO26 | Motor 2 PWM output (closed loop, driven by the encoder below) |  | blue |
+| GPIO4  | Hall sensor / encoder pulse input (interrupt) — measures motor 2's shaft |  | blue |
+| GPIO34 | Motor 1 manual override potentiometer (ADC1-only pin) |  | blue |
+| GPIO35 | Motor 2 potentiometer — manual override PWM, or target speed setpoint in auto mode (ADC1-only pin) |  | blue |
+| GPIO13 | Button: LEFT |  | blue |
+| GPIO27 | Button: RIGHT |  | blue |
+| GPIO32 | Button: UP |  | blue |
+| GPIO33 | Button: DOWN |  | blue |
+| GPIO14 | Button: SELECT |  | blue |
 
-Red is always + 3.3V, Black is always GND. Blue is used for 5V from the ESP
+Every row above is a DC control-circuit conductor (logic-level signal, not a power feed), which
+is why EN 60204-1 puts all of them under the same color — **blue**. The standard reserves other
+colors for different roles: **black** for DC/AC power circuit conductors (the +3.3V/5V/GND
+supply rails, not any row in this table), **green/yellow** exclusively for the protective earth
+(PE) conductor bonded to the enclosure/frame (distinct from logic GND — see the note below), and
+**orange** specifically for circuits that must stay energized when the main isolator is off, e.g.
+an emergency-stop monitoring loop (see [Machine Directive / CE compliance](#machine-directive--ce-compliance)
+below).
+
+Red is always + 3.3V, Black is always GND. Blue is used for 5V from the ESP. Note this cabinet
+convention doesn't itself follow EN 60204-1 (which reserves black for power circuits generally,
+not GND specifically, and blue for DC control circuits, not a 5V supply feed) — it predates
+adding the column above and hasn't been reconciled with it yet.
 
 
 
@@ -78,14 +121,14 @@ the last one sent. Purely one-way (Wemos -> ESP32), 9600 baud — nothing is req
 back, and the ESP32 side (`software/spool2spool-esp32`) just listens on Serial2 (GPIO16) and
 keeps the last value it received.
 
-| Wemos pin | Function | Cable color |
-|-----------|----------|-------------|
-| D1 (GPIO5) | AS5600 SCL |  |
-| D2 (GPIO4) | AS5600 SDA |  |
-| TX | Data out, to the ESP32's GPIO16 (Serial2 RX) |  |
-| 5V | Power in, from the ESP32 devkit's 5V/VIN pin |  |
-| 3V3 | Powers the AS5600 — not the incoming 5V, keeps the sensor on the same 3.3V rail as the I2C logic |  |
-| GND | Common ground, shared with the ESP32 and the cable shield |  |
+| Wemos pin | Function | Cable color | Suggested color (EN 60204-1) |
+|-----------|----------|-------------|-------------|
+| D1 (GPIO5) | AS5600 SCL |  | blue (DC control circuit) |
+| D2 (GPIO4) | AS5600 SDA |  | blue (DC control circuit) |
+| TX | Data out, to the ESP32's GPIO16 (Serial2 RX) |  | blue (DC control circuit) |
+| 5V | Power in, from the ESP32 devkit's 5V/VIN pin |  | black (DC power circuit) |
+| 3V3 | Powers the AS5600 — not the incoming 5V, keeps the sensor on the same 3.3V rail as the I2C logic |  | black (DC power circuit) |
+| GND | Common ground, shared with the ESP32 and the cable shield |  | black (power circuit return — only use green/yellow if this conductor is actually bonded to protective earth, not for a floating logic GND) |
 
 The AS5600's DIR pin ties to GND (or VCC — either works, just don't leave it floating); GPO is
 unused since only I2C is needed here.
@@ -158,5 +201,11 @@ Firmware:
 - [ ] Real compile verification of `spool2spool-esp32.ino` via arduino-cli is still outstanding —
       blocked so far by a network policy restriction, not yet re-attempted
 
+Hardware / compliance:
 
+- [ ] Add a hardware emergency stop (Category 0, EN ISO 13850 / EN 60204-1 §9.2.5.4) wired
+      directly in series with the 24V supply to both BTS7960 drivers, not just a GPIO the
+      firmware reads — see [Machine Directive / CE compliance](#machine-directive--ce-compliance)
+- [ ] Document a risk assessment (EN ISO 12100) covering the arm/spool pinch points before this
+      leaves the bench
 
