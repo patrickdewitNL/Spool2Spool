@@ -38,6 +38,7 @@ Wemos D1 mini node reading the arm angle right at the pivot.
 ## Hardware
 
 - ESP-WROOM-32 devkit (30-pin), 3.3V logic throughout
+  - ESP mounted using https://www.printables.com/model/1590288-esp32-wroom-32-din-rail-mounting-adapter and https://www.printables.com/model/472505-din-rail-bracket-redux/files
 - 20x4 I2C LCD (PCF8574-based backpack, address 0x27)
 - 5 discrete pushbuttons (LEFT/RIGHT/UP/DOWN/SELECT), each to GND, using the ESP32's internal
   pull-ups — no external resistors, no resistor-ladder shield
